@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import gpytorch
 import torch
 from gpytorch.constraints import Positive
+from gpytorch.priors import HalfCauchyPrior
+
+
+DEFAULT_EPS_ALPHA = 0.1
+
+
+def _initialize_kernel_lengthscale(kernel: gpytorch.kernels.Kernel, dim: int) -> None:
+    """Initialize RBF lengthscales to sqrt(dim), matching report instructions."""
+    if hasattr(kernel, "lengthscale"):
+        kernel.lengthscale = math.sqrt(dim)
 
 
 class ProjectedKernel(gpytorch.kernels.Kernel):
@@ -31,6 +42,7 @@ class ProjectedKernel(gpytorch.kernels.Kernel):
             ard_num_dims=subspace_dim,
             lengthscale_constraint=Positive(),
         )
+        _initialize_kernel_lengthscale(self.base_kernel, subspace_dim)
 
         self.register_parameter(
             name="W",
@@ -73,6 +85,7 @@ class CompositeKernel(gpytorch.kernels.Kernel):
         subspace_dim: int,
         projected_base_kernel: Optional[gpytorch.kernels.Kernel] = None,
         residual_kernel: Optional[gpytorch.kernels.Kernel] = None,
+        eps_alpha: float = DEFAULT_EPS_ALPHA,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -85,21 +98,33 @@ class CompositeKernel(gpytorch.kernels.Kernel):
             ard_num_dims=input_dim,
             lengthscale_constraint=Positive(),
         )
+        _initialize_kernel_lengthscale(self.residual_kernel, input_dim)
 
         self.register_parameter(
             name="raw_eps", parameter=torch.nn.Parameter(torch.tensor(0.0))
         )
         self.register_constraint("raw_eps", Positive())
+        self.register_prior(
+            "eps_prior",
+            HalfCauchyPrior(scale=eps_alpha),
+            lambda m: m.eps,
+            lambda m, v: m._set_eps(v),
+        )
 
     @property
     def eps(self) -> torch.Tensor:
         return self.raw_eps_constraint.transform(self.raw_eps)
 
+    def _set_eps(self, value: torch.Tensor | float) -> None:
+        if not torch.is_tensor(value):
+            value = torch.as_tensor(
+                value, dtype=self.raw_eps.dtype, device=self.raw_eps.device
+            )
+        self.initialize(raw_eps=self.raw_eps_constraint.inverse_transform(value))
+
     @eps.setter
     def eps(self, value: torch.Tensor | float) -> None:
-        if not torch.is_tensor(value):
-            value = torch.as_tensor(value, dtype=self.raw_eps.dtype, device=self.raw_eps.device)
-        self.initialize(raw_eps=self.raw_eps_constraint.inverse_transform(value))
+        self._set_eps(value)
 
     @property
     def W(self) -> torch.nn.Parameter:
@@ -129,7 +154,7 @@ class _BaseExactGP(gpytorch.models.ExactGP):
         super().__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ConstantMean()
 
-        # Ensure positive noise even if caller provided custom likelihood defaults.
+        # Keep positivity on observation noise.
         self.likelihood.noise_covar.register_constraint("raw_noise", Positive())
 
     def forward(self, x: torch.Tensor) -> gpytorch.distributions.MultivariateNormal:
@@ -156,6 +181,7 @@ class StandardGPModel(_BaseExactGP):
             ard_num_dims=input_dim,
             lengthscale_constraint=Positive(),
         )
+        _initialize_kernel_lengthscale(base_kernel, input_dim)
         self.covar_module = gpytorch.kernels.ScaleKernel(
             base_kernel,
             outputscale_constraint=Positive(),
@@ -195,11 +221,16 @@ class CompositeGPModel(_BaseExactGP):
         likelihood: gpytorch.likelihoods.GaussianLikelihood,
         input_dim: int,
         subspace_dim: int,
+        eps_alpha: float = DEFAULT_EPS_ALPHA,
     ) -> None:
         super().__init__(train_x, train_y, likelihood)
 
         self.covar_module = gpytorch.kernels.ScaleKernel(
-            CompositeKernel(input_dim=input_dim, subspace_dim=subspace_dim),
+            CompositeKernel(
+                input_dim=input_dim,
+                subspace_dim=subspace_dim,
+                eps_alpha=eps_alpha,
+            ),
             outputscale_constraint=Positive(),
         )
 
