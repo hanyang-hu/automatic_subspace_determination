@@ -18,8 +18,8 @@ It also includes a **Riemannian Adam** optimizer for Stiefel-constrained project
 ## Installation
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+conda create -n asd-gp python=3.11 -y
+conda activate asd-gp
 pip install -r requirements.txt
 ```
 

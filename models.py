@@ -100,10 +100,7 @@ class CompositeKernel(gpytorch.kernels.Kernel):
         )
         _initialize_kernel_lengthscale(self.residual_kernel, input_dim)
 
-        self.register_parameter(
-            name="raw_eps", parameter=torch.nn.Parameter(torch.tensor(0.0))
-        )
-        self.register_constraint("raw_eps", Positive())
+        self._ensure_raw_eps()
         self.register_prior(
             "eps_prior",
             HalfCauchyPrior(scale=eps_alpha),
@@ -111,11 +108,22 @@ class CompositeKernel(gpytorch.kernels.Kernel):
             lambda m, v: m._set_eps(v),
         )
 
+    def _ensure_raw_eps(self) -> None:
+        """Ensure ``raw_eps`` exists for compatibility with older objects/state."""
+        if "raw_eps" not in self._parameters:
+            self.register_parameter(
+                name="raw_eps", parameter=torch.nn.Parameter(torch.tensor(0.0))
+            )
+        if "raw_eps_constraint" not in self._constraints:
+            self.register_constraint("raw_eps", Positive())
+
     @property
     def eps(self) -> torch.Tensor:
+        self._ensure_raw_eps()
         return self.raw_eps_constraint.transform(self.raw_eps)
 
     def _set_eps(self, value: torch.Tensor | float) -> None:
+        self._ensure_raw_eps()
         if not torch.is_tensor(value):
             value = torch.as_tensor(
                 value, dtype=self.raw_eps.dtype, device=self.raw_eps.device
@@ -237,6 +245,15 @@ class CompositeGPModel(_BaseExactGP):
     @property
     def W(self) -> torch.nn.Parameter:
         return self.covar_module.base_kernel.W
+
+    def _ensure_raw_eps(self) -> None:
+        """Ensure ``raw_eps`` exists for compatibility with older objects/state."""
+        if "raw_eps" not in self._parameters:
+            self.register_parameter(
+                name="raw_eps", parameter=torch.nn.Parameter(torch.tensor(0.0))
+            )
+        if "raw_eps_constraint" not in self._constraints:
+            self.register_constraint("raw_eps", Positive())
 
     @property
     def eps(self) -> torch.Tensor:
