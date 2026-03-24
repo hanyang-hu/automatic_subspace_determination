@@ -100,7 +100,7 @@ def evaluate_model(model, likelihood, test_x, test_y):
 
 
 @torch.no_grad()
-def visualize_results(output_dir: Path, model_name: str, train_x, train_y, test_x, test_y, pred_mean, losses):
+def visualize_results(output_dir: Path, model_name: str, model, train_x, train_y, test_x, test_y, pred_mean, losses):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(6, 4))
@@ -207,6 +207,7 @@ def main() -> None:
     visualize_results(
         args.output_dir,
         args.model,
+        model,
         train_x,
         train_y,
         test_x,
