@@ -1,0 +1,212 @@
+"""GP model definitions for full-space, projected, and composite kernels."""
+
+from __future__ import annotations
+
+from typing import Optional
+
+import gpytorch
+import torch
+from gpytorch.constraints import Positive
+
+
+class ProjectedKernel(gpytorch.kernels.Kernel):
+    """Kernel wrapper that projects inputs before applying a base kernel."""
+
+    has_lengthscale = False
+
+    def __init__(
+        self,
+        input_dim: int,
+        subspace_dim: int,
+        base_kernel: Optional[gpytorch.kernels.Kernel] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        if subspace_dim > input_dim:
+            raise ValueError("subspace_dim must be <= input_dim")
+
+        self.input_dim = input_dim
+        self.subspace_dim = subspace_dim
+        self.base_kernel = base_kernel or gpytorch.kernels.RBFKernel(
+            ard_num_dims=subspace_dim,
+            lengthscale_constraint=Positive(),
+        )
+
+        self.register_parameter(
+            name="W",
+            parameter=torch.nn.Parameter(self._stiefel_init(input_dim, subspace_dim)),
+        )
+
+    @staticmethod
+    def _stiefel_init(input_dim: int, subspace_dim: int) -> torch.Tensor:
+        """Initialize W on the Stiefel manifold via QR decomposition."""
+        q, _ = torch.linalg.qr(torch.randn(input_dim, subspace_dim))
+        return q[:, :subspace_dim]
+
+    def project(self, x: torch.Tensor) -> torch.Tensor:
+        if x.size(-1) != self.input_dim:
+            raise ValueError(
+                f"Expected input dimension {self.input_dim}, got {x.size(-1)}"
+            )
+        return x @ self.W
+
+    def forward(
+        self,
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        diag: bool = False,
+        **params,
+    ) -> torch.Tensor:
+        x1_proj = self.project(x1)
+        x2_proj = self.project(x2)
+        return self.base_kernel(x1_proj, x2_proj, diag=diag, **params)
+
+
+class CompositeKernel(gpytorch.kernels.Kernel):
+    """Composite kernel with projected and residual full-space terms."""
+
+    has_lengthscale = False
+
+    def __init__(
+        self,
+        input_dim: int,
+        subspace_dim: int,
+        projected_base_kernel: Optional[gpytorch.kernels.Kernel] = None,
+        residual_kernel: Optional[gpytorch.kernels.Kernel] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.projected_kernel = ProjectedKernel(
+            input_dim=input_dim,
+            subspace_dim=subspace_dim,
+            base_kernel=projected_base_kernel,
+        )
+        self.residual_kernel = residual_kernel or gpytorch.kernels.RBFKernel(
+            ard_num_dims=input_dim,
+            lengthscale_constraint=Positive(),
+        )
+
+        self.register_parameter(
+            name="raw_eps", parameter=torch.nn.Parameter(torch.tensor(0.0))
+        )
+        self.register_constraint("raw_eps", Positive())
+
+    @property
+    def eps(self) -> torch.Tensor:
+        return self.raw_eps_constraint.transform(self.raw_eps)
+
+    @eps.setter
+    def eps(self, value: torch.Tensor | float) -> None:
+        if not torch.is_tensor(value):
+            value = torch.as_tensor(value, dtype=self.raw_eps.dtype, device=self.raw_eps.device)
+        self.initialize(raw_eps=self.raw_eps_constraint.inverse_transform(value))
+
+    @property
+    def W(self) -> torch.nn.Parameter:
+        return self.projected_kernel.W
+
+    def forward(
+        self,
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        diag: bool = False,
+        **params,
+    ) -> torch.Tensor:
+        projected_term = self.projected_kernel(x1, x2, diag=diag, **params)
+        residual_term = self.residual_kernel(x1, x2, diag=diag, **params)
+        return projected_term + self.eps * residual_term
+
+
+class _BaseExactGP(gpytorch.models.ExactGP):
+    """Shared setup for exact GP models in this repository."""
+
+    def __init__(
+        self,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        likelihood: gpytorch.likelihoods.GaussianLikelihood,
+    ) -> None:
+        super().__init__(train_x, train_y, likelihood)
+        self.mean_module = gpytorch.means.ConstantMean()
+
+        # Ensure positive noise even if caller provided custom likelihood defaults.
+        self.likelihood.noise_covar.register_constraint("raw_noise", Positive())
+
+    def forward(self, x: torch.Tensor) -> gpytorch.distributions.MultivariateNormal:
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+
+class StandardGPModel(_BaseExactGP):
+    """Exact GP with a standard full-space kernel."""
+
+    def __init__(
+        self,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        likelihood: gpytorch.likelihoods.GaussianLikelihood,
+        input_dim: int,
+        subspace_dim: int,
+    ) -> None:
+        super().__init__(train_x, train_y, likelihood)
+        del subspace_dim  # Kept for constructor consistency across model choices.
+
+        base_kernel = gpytorch.kernels.RBFKernel(
+            ard_num_dims=input_dim,
+            lengthscale_constraint=Positive(),
+        )
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            base_kernel,
+            outputscale_constraint=Positive(),
+        )
+
+
+class ProjectedGPModel(_BaseExactGP):
+    """Exact GP operating purely in a learned projected subspace."""
+
+    def __init__(
+        self,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        likelihood: gpytorch.likelihoods.GaussianLikelihood,
+        input_dim: int,
+        subspace_dim: int,
+    ) -> None:
+        super().__init__(train_x, train_y, likelihood)
+
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            ProjectedKernel(input_dim=input_dim, subspace_dim=subspace_dim),
+            outputscale_constraint=Positive(),
+        )
+
+    @property
+    def W(self) -> torch.nn.Parameter:
+        return self.covar_module.base_kernel.W
+
+
+class CompositeGPModel(_BaseExactGP):
+    """Exact GP with projected + epsilon-weighted full-space residual kernel."""
+
+    def __init__(
+        self,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        likelihood: gpytorch.likelihoods.GaussianLikelihood,
+        input_dim: int,
+        subspace_dim: int,
+    ) -> None:
+        super().__init__(train_x, train_y, likelihood)
+
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            CompositeKernel(input_dim=input_dim, subspace_dim=subspace_dim),
+            outputscale_constraint=Positive(),
+        )
+
+    @property
+    def W(self) -> torch.nn.Parameter:
+        return self.covar_module.base_kernel.W
+
+    @property
+    def eps(self) -> torch.Tensor:
+        return self.covar_module.base_kernel.eps
