@@ -84,3 +84,41 @@ def make_linear_subspace_data(
     y_clean = g(z)
     y = y_clean + noise_std * torch.randn_like(y_clean)
     return x, y, W_true
+
+
+def make_linear_subspace_train_test_split(
+    n_train: int,
+    n_test: int,
+    input_dim: int,
+    subspace_dim: int,
+    noise_std: float,
+    *,
+    latent_kind: str = "smooth",
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Generate quasi-random data once, then split into train and test sets.
+
+    Inputs are sampled with a Sobol engine and scaled to ``[-2.5, 2.5]^D``.
+    Targets are generated from one shared ``W_true`` and latent function.
+    """
+    n_total = n_train + n_test
+    sobol = torch.quasirandom.SobolEngine(dimension=input_dim, scramble=True)
+    x_unit = sobol.draw(n_total).to(device=device, dtype=dtype)
+    x = 5.0 * (x_unit - 0.5)
+
+    q, _ = torch.linalg.qr(
+        torch.randn(input_dim, subspace_dim, device=device, dtype=dtype),
+        mode="reduced",
+    )
+    W_true = q[:, :subspace_dim]
+
+    z = x @ W_true
+    g = make_latent_function(latent_kind)
+    y_clean = g(z)
+    y = y_clean + noise_std * torch.randn_like(y_clean)
+
+    perm = torch.randperm(n_total, device=device)
+    train_idx = perm[:n_train]
+    test_idx = perm[n_train:]
+    return x[train_idx], y[train_idx], x[test_idx], y[test_idx], W_true

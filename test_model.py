@@ -7,11 +7,12 @@ from pathlib import Path
 
 import gpytorch
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 
 from manifold_optim import RiemannianAdam
 from models import CompositeGPModel, ProjectedGPModel, StandardGPModel
-from utils import make_linear_subspace_data, orthogonality_error, set_seed
+from utils import make_linear_subspace_train_test_split, orthogonality_error, set_seed
 
 
 MODEL_REGISTRY = {
@@ -100,7 +101,16 @@ def evaluate_model(model, likelihood, test_x, test_y):
 
 
 @torch.no_grad()
-def visualize_results(output_dir: Path, model_name: str, model, train_x, train_y, test_x, test_y, pred_mean, losses):
+def visualize_results(
+    output_dir: Path,
+    model_name: str,
+    model,
+    test_x,
+    test_y_denorm,
+    pred_mean_denorm,
+    losses,
+    W_true,
+):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(6, 4))
@@ -114,39 +124,71 @@ def visualize_results(output_dir: Path, model_name: str, model, train_x, train_y
 
     # Scatter comparison plot works regardless of ambient dimensionality.
     fig, ax = plt.subplots(figsize=(5, 5))
-    ax.scatter(test_y.cpu().numpy(), pred_mean.cpu().numpy(), s=15, alpha=0.7)
-    mn = min(test_y.min().item(), pred_mean.min().item())
-    mx = max(test_y.max().item(), pred_mean.max().item())
+    ax.scatter(test_y_denorm.cpu().numpy(), pred_mean_denorm.cpu().numpy(), s=15, alpha=0.7)
+    mn = min(test_y_denorm.min().item(), pred_mean_denorm.min().item())
+    mx = max(test_y_denorm.max().item(), pred_mean_denorm.max().item())
     ax.plot([mn, mx], [mn, mx], "k--", linewidth=1)
     ax.set_xlabel("Ground truth")
     ax.set_ylabel("Predicted mean")
-    ax.set_title(f"Prediction vs truth ({model_name})")
+    ax.set_title(f"Prediction vs truth (original scale, {model_name})")
     fig.tight_layout()
     fig.savefig(output_dir / f"pred_vs_truth_{model_name}.png", dpi=150)
     plt.close(fig)
 
-    # For D>=2, visualize a 2D response slice with remaining dimensions fixed to 0.
-    if test_x.shape[-1] >= 2:
-        grid_n = 60
-        x1 = torch.linspace(-2.5, 2.5, grid_n, device=test_x.device)
-        x2 = torch.linspace(-2.5, 2.5, grid_n, device=test_x.device)
-        xx1, xx2 = torch.meshgrid(x1, x2, indexing="ij")
+    # Visualize objective value + response in true/estimated subspaces.
+    fig = plt.figure(figsize=(12, 8))
+    gs = fig.add_gridspec(2, 2)
+    ax_loss = fig.add_subplot(gs[0, :])
+    ax_loss.plot(losses)
+    ax_loss.set_xlabel("Iteration")
+    ax_loss.set_ylabel("-MLL loss")
+    ax_loss.set_title(f"Objective function trajectory ({model_name})")
 
-        x_grid = torch.zeros(grid_n * grid_n, test_x.shape[-1], device=test_x.device)
-        x_grid[:, 0] = xx1.reshape(-1)
-        x_grid[:, 1] = xx2.reshape(-1)
+    def _to_3d_coords(arr: torch.Tensor) -> np.ndarray:
+        cols = min(2, arr.shape[-1])
+        out = torch.zeros(arr.shape[0], 3, device=arr.device, dtype=arr.dtype)
+        out[:, :cols] = arr[:, :cols]
+        return out.cpu().numpy()
 
-        model.eval()
-        pred_grid = model(x_grid).mean.reshape(grid_n, grid_n).cpu().numpy()
+    z_true = test_x @ W_true
+    pts_true = _to_3d_coords(z_true)
+    pts_true[:, 2] = test_y_denorm.detach().cpu().numpy()
+    ax_true = fig.add_subplot(gs[1, 0], projection="3d")
+    sc_true = ax_true.scatter(pts_true[:, 0], pts_true[:, 1], pts_true[:, 2], c=pts_true[:, 2], s=12, cmap="viridis")
+    ax_true.set_xlabel("true z1")
+    ax_true.set_ylabel("true z2")
+    ax_true.set_zlabel("y")
+    ax_true.set_title("Ground-truth response on true subspace")
+    fig.colorbar(sc_true, ax=ax_true, shrink=0.7, pad=0.1)
 
-        fig, ax = plt.subplots(figsize=(6, 5))
-        pcm = ax.pcolormesh(xx1.cpu().numpy(), xx2.cpu().numpy(), pred_grid, shading="auto")
-        fig.colorbar(pcm, ax=ax, label="Predicted response")
-        ax.set_xlabel("x[0]")
-        ax.set_ylabel("x[1]")
-        ax.set_title(f"Predicted response surface slice ({model_name})")
+    if hasattr(model, "W"):
+        z_est = test_x @ model.W.detach()
+    else:
+        z_est = test_x[:, : W_true.shape[-1]]
+    pts_est = _to_3d_coords(z_est)
+    pts_est[:, 2] = pred_mean_denorm.detach().cpu().numpy()
+    ax_est = fig.add_subplot(gs[1, 1], projection="3d")
+    sc_est = ax_est.scatter(pts_est[:, 0], pts_est[:, 1], pts_est[:, 2], c=pts_est[:, 2], s=12, cmap="plasma")
+    ax_est.set_xlabel("estimated z1")
+    ax_est.set_ylabel("estimated z2")
+    ax_est.set_zlabel("pred y")
+    ax_est.set_title("Predicted response on estimated subspace")
+    fig.colorbar(sc_est, ax=ax_est, shrink=0.7, pad=0.1)
+
+    fig.tight_layout()
+    fig.savefig(output_dir / f"objective_and_subspace_response_{model_name}.png", dpi=150)
+    plt.close(fig)
+
+    if hasattr(model, "W"):
+        fig, ax = plt.subplots(figsize=(5, 4))
+        overlap = (W_true.transpose(-2, -1) @ model.W.detach()).abs().cpu().numpy()
+        im = ax.imshow(overlap, cmap="magma", vmin=0.0, vmax=1.0)
+        ax.set_xlabel("Estimated basis index")
+        ax.set_ylabel("True basis index")
+        ax.set_title("Subspace overlap |W_true^T W_est|")
+        fig.colorbar(im, ax=ax, label="Absolute overlap")
         fig.tight_layout()
-        fig.savefig(output_dir / f"surface_slice_{model_name}.png", dpi=150)
+        fig.savefig(output_dir / f"subspace_overlap_{model_name}.png", dpi=150)
         plt.close(fig)
 
 
@@ -158,15 +200,8 @@ def main() -> None:
     if args.device == "cuda" and device.type != "cuda":
         print("CUDA requested but not available; falling back to CPU.")
 
-    train_x, train_y, W_true = make_linear_subspace_data(
+    train_x, train_y_raw, test_x, test_y_raw, W_true = make_linear_subspace_train_test_split(
         args.n_train,
-        args.D,
-        args.k_true,
-        args.noise_std,
-        latent_kind=args.latent,
-        device=device,
-    )
-    test_x, test_y, _ = make_linear_subspace_data(
         args.n_test,
         args.D,
         args.k_true,
@@ -174,6 +209,10 @@ def main() -> None:
         latent_kind=args.latent,
         device=device,
     )
+    train_y_mean = train_y_raw.mean()
+    train_y_std = train_y_raw.std(unbiased=False).clamp_min(1e-6)
+    train_y = (train_y_raw - train_y_mean) / train_y_std
+    test_y = (test_y_raw - train_y_mean) / train_y_std
 
     likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
     model_cls = MODEL_REGISTRY[args.model]
@@ -191,10 +230,13 @@ def main() -> None:
 
     losses = train_model(model, likelihood, train_x, train_y, iters=args.iters, lr=args.lr)
     rmse, nll, pred_mean, _ = evaluate_model(model, likelihood, test_x, test_y)
+    pred_mean_denorm = pred_mean * train_y_std + train_y_mean
+    rmse_denorm = torch.sqrt(torch.mean((pred_mean_denorm - test_y_raw) ** 2)).item()
 
     print(f"Model: {args.model}")
-    print(f"RMSE: {rmse:.4f}")
-    print(f"NLL / sample: {nll:.4f}")
+    print(f"RMSE (normalized target): {rmse:.4f}")
+    print(f"RMSE (original target scale): {rmse_denorm:.4f}")
+    print(f"NLL / sample (normalized target): {nll:.4f}")
 
     if hasattr(model, "W"):
         est_W = model.W.detach()
@@ -208,12 +250,11 @@ def main() -> None:
         args.output_dir,
         args.model,
         model,
-        train_x,
-        train_y,
         test_x,
-        test_y,
-        pred_mean,
+        test_y_raw,
+        pred_mean_denorm,
         losses,
+        W_true,
     )
     print(f"Saved artifacts to: {args.output_dir.resolve()}")
 

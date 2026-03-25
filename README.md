@@ -13,7 +13,7 @@ It also includes a **Riemannian Adam** optimizer for Stiefel-constrained project
 - `models.py`: GPyTorch model and kernel implementations with positivity constraints and Half-Cauchy priors.
 - `utils.py`: Stiefel geometry helpers + synthetic data generation utilities.
 - `manifold_optim.py`: `RiemannianAdam` optimizer implementation.
-- `test_model.py`: CLI script for synthetic experiments, metrics, and visualization.
+- `test_model.py`: CLI script for synthetic experiments, metrics, target normalization, and visualization.
 
 ## Installation
 
@@ -45,13 +45,21 @@ Optional flags:
 - `--device {cpu,cuda}`: run on GPU when available.
 - `--output_dir artifacts`: folder for output plots.
 
+## Data generation in `test_model.py`
+
+- Inputs are generated once with Sobol quasi-random samples on `[-2.5, 2.5]^D`, then randomly split into train/test.
+- Train and test therefore come from the same distribution (not disjoint regions).
+- Targets are normalized with train-set mean/std before GP fitting.
+- Metrics report both normalized-scale RMSE and original-scale RMSE.
+
 ## Expected outputs
 
 The script saves plots under `artifacts/`:
 
 - `loss_curve_<model>.png`
 - `pred_vs_truth_<model>.png`
-- `surface_slice_<model>.png` (for ambient dimension >= 2)
+- `objective_and_subspace_response_<model>.png`
+- `subspace_overlap_<model>.png` (for models that learn `W`)
 
 and prints summary metrics:
 
