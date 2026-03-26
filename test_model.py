@@ -150,7 +150,7 @@ def visualize_results(
     fig.savefig(output_dir / f"pred_vs_truth_{model_name}.png", dpi=150)
     plt.close(fig)
 
-    if train_x.shape[1] == 2 and W_true.shape[1] >= 1:
+    if train_x.shape[1] == 2 and W_true.shape[1] == 1:
         fig = plt.figure(figsize=(9, 7))
         ax = fig.add_subplot(111, projection="3d")
 
@@ -227,16 +227,21 @@ def visualize_results(
         ax.set_ylabel("y")
         ax.set_zlabel("output")
         ax.set_title("Ground-truth surface, data, and true/estimated 1D subspace planes")
+        ax.view_init(elev=24, azim=-57)
 
         legend_handles = [
             plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:blue", markersize=8, label="Train data"),
             plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:orange", markersize=8, label="Test data"),
             plt.Line2D([0], [0], color="teal", linewidth=6, alpha=0.5, label="Ground-truth surface"),
             plt.Line2D([0], [0], color="tab:green", linewidth=6, alpha=0.4, label="True 1D subspace plane"),
+            plt.Line2D([0], [0], color="tab:green", linewidth=2.5, label="True 1D subspace line (z=0)"),
         ]
         if hasattr(model, "W") and model.W.shape[1] >= 1:
             legend_handles.append(
                 plt.Line2D([0], [0], color="tab:red", linewidth=6, alpha=0.4, label="Estimated 1D subspace plane")
+            )
+            legend_handles.append(
+                plt.Line2D([0], [0], color="tab:red", linewidth=2.5, label="Estimated 1D subspace line (z=0)")
             )
         ax.legend(handles=legend_handles, loc="upper left")
 
