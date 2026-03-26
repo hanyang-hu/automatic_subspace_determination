@@ -54,11 +54,11 @@ def set_seed(seed: int) -> None:
 def make_latent_function(kind: str = "smooth") -> Callable[[torch.Tensor], torch.Tensor]:
     """Return a latent response function defined on the projected coordinates."""
     if kind == "linear":
-        return lambda z: z.sum(dim=-1)
+        return lambda z: z[..., 0]
     if kind == "smooth":
-        return lambda z: torch.sin(2.0 * z[..., 0]) + 0.5 * torch.cos(3.0 * z[..., -1])
+        return lambda z: torch.sin(2.0 * z[..., 0]) + 0.5 * torch.cos(3.0 * z[..., 0])
     if kind == "nonlinear":
-        return lambda z: torch.sin(2.0 * z[..., 0]) + 0.3 * z.square().sum(dim=-1)
+        return lambda z: torch.sin(2.0 * z[..., 0]) + 0.3 * z[..., 0].square()
     raise ValueError(f"Unsupported latent function kind: {kind}")
 
 

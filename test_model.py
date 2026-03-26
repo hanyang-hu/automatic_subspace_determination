@@ -32,9 +32,9 @@ MODEL_REGISTRY = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", choices=MODEL_REGISTRY, default="composite")
-    parser.add_argument("--D", type=int, default=5, help="Ambient input dimension")
-    parser.add_argument("--k_true", type=int, default=2, help="True latent subspace dim")
-    parser.add_argument("--k_model", type=int, default=2, help="Model latent subspace dim")
+    parser.add_argument("--D", type=int, default=2, help="Ambient input dimension")
+    parser.add_argument("--k_true", type=int, default=1, help="True latent subspace dim")
+    parser.add_argument("--k_model", type=int, default=1, help="Model latent subspace dim")
     parser.add_argument("--n_train", type=int, default=200)
     parser.add_argument("--n_test", type=int, default=200)
     parser.add_argument("--noise_std", type=float, default=0.1)
@@ -45,7 +45,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent", default="smooth", choices=["linear", "smooth", "nonlinear"])
     parser.add_argument("--output_dir", type=Path, default=Path("artifacts"))
     parser.add_argument("--eps_alpha", type=float, default=0.01, help="Half-Cauchy prior scale for composite eps")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.D != 2:
+        raise ValueError("This visualization script expects a 2D input space. Please run with --D 2.")
+    if args.k_true != 1:
+        raise ValueError("Toy data generation is configured for a 1D true response subspace. Please run with --k_true 1.")
+    return args
 
 
 def split_parameter_groups(model: torch.nn.Module) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
@@ -145,7 +150,7 @@ def visualize_results(
     fig.savefig(output_dir / f"pred_vs_truth_{model_name}.png", dpi=150)
     plt.close(fig)
 
-    if train_x.shape[1] == 2 and W_true.shape[1] >= 1:
+    if train_x.shape[1] == 2 and W_true.shape[1] == 1:
         fig = plt.figure(figsize=(9, 7))
         ax = fig.add_subplot(111, projection="3d")
 
@@ -192,44 +197,53 @@ def visualize_results(
 
         z_low = min(train_y_denorm.min().item(), test_y_denorm.min().item(), zz_true.min().item())
         z_high = max(train_y_denorm.max().item(), test_y_denorm.max().item(), zz_true.max().item())
-        z_range = np.linspace(z_low, z_high, 40)
+        z_low -= 0.15 * (z_high - z_low + 1e-8)
+        z_high += 0.15 * (z_high - z_low + 1e-8)
+        z_range = torch.linspace(z_low, z_high, 50, device=all_x.device, dtype=all_x.dtype)
+        xy_radius = 0.7 * float(torch.linalg.vector_norm(x_max - x_min).item())
+
+        def _plot_vertical_plane(direction_xy: torch.Tensor, color: str, alpha: float, label_line: str):
+            direction_xy = direction_xy / torch.linalg.vector_norm(direction_xy).clamp_min(1e-12)
+            t = torch.linspace(-xy_radius, xy_radius, 30, device=direction_xy.device, dtype=direction_xy.dtype)
+            tt, zz = torch.meshgrid(t, z_range, indexing="xy")
+            px = (tt * direction_xy[0]).detach().cpu().numpy()
+            py = (tt * direction_xy[1]).detach().cpu().numpy()
+            pz = zz.detach().cpu().numpy()
+            ax.plot_surface(px, py, pz, color=color, alpha=alpha, linewidth=0, shade=False)
+            # draw the 1D subspace line at z=0 to make containment explicit
+            line_t = torch.linspace(-xy_radius, xy_radius, 120, device=direction_xy.device, dtype=direction_xy.dtype)
+            line_x = (line_t * direction_xy[0]).detach().cpu().numpy()
+            line_y = (line_t * direction_xy[1]).detach().cpu().numpy()
+            ax.plot(line_x, line_y, np.zeros_like(line_x), color=color, linewidth=2.5, label=label_line)
 
         w_true_2d = W_true[:2, 0]
         if torch.linalg.vector_norm(w_true_2d) > 0:
-            w_true_2d = w_true_2d / torch.linalg.vector_norm(w_true_2d)
-            t_true = torch.linspace(-3.0, 3.0, 2, device=w_true_2d.device, dtype=w_true_2d.dtype)
-            s_true = torch.tensor(z_range, device=w_true_2d.device, dtype=w_true_2d.dtype)
-            tt_true, ss_true = torch.meshgrid(t_true, s_true, indexing="xy")
-            px_true = (tt_true * w_true_2d[0]).detach().cpu().numpy()
-            py_true = (tt_true * w_true_2d[1]).detach().cpu().numpy()
-            pz_true = ss_true.detach().cpu().numpy()
-            ax.plot_surface(px_true, py_true, pz_true, color="tab:green", alpha=0.20, linewidth=0)
+            _plot_vertical_plane(w_true_2d, color="tab:green", alpha=0.22, label_line="True 1D subspace line")
 
         if hasattr(model, "W") and model.W.shape[1] >= 1:
             w_est_2d = model.W.detach()[:2, 0]
             if torch.linalg.vector_norm(w_est_2d) > 0:
-                w_est_2d = w_est_2d / torch.linalg.vector_norm(w_est_2d)
-                t_est = torch.linspace(-3.0, 3.0, 2, device=w_est_2d.device, dtype=w_est_2d.dtype)
-                s_est = torch.tensor(z_range, device=w_est_2d.device, dtype=w_est_2d.dtype)
-                tt_est, ss_est = torch.meshgrid(t_est, s_est, indexing="xy")
-                px_est = (tt_est * w_est_2d[0]).detach().cpu().numpy()
-                py_est = (tt_est * w_est_2d[1]).detach().cpu().numpy()
-                pz_est = ss_est.detach().cpu().numpy()
-                ax.plot_surface(px_est, py_est, pz_est, color="tab:red", alpha=0.20, linewidth=0)
+                _plot_vertical_plane(w_est_2d, color="tab:red", alpha=0.22, label_line="Estimated 1D subspace line")
 
         ax.set_xlabel("x")
         ax.set_ylabel("y")
         ax.set_zlabel("output")
         ax.set_title("Ground-truth surface, data, and true/estimated 1D subspace planes")
+        ax.view_init(elev=24, azim=-57)
 
         legend_handles = [
             plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:blue", markersize=8, label="Train data"),
             plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:orange", markersize=8, label="Test data"),
+            plt.Line2D([0], [0], color="teal", linewidth=6, alpha=0.5, label="Ground-truth surface"),
             plt.Line2D([0], [0], color="tab:green", linewidth=6, alpha=0.4, label="True 1D subspace plane"),
+            plt.Line2D([0], [0], color="tab:green", linewidth=2.5, label="True 1D subspace line (z=0)"),
         ]
         if hasattr(model, "W") and model.W.shape[1] >= 1:
             legend_handles.append(
                 plt.Line2D([0], [0], color="tab:red", linewidth=6, alpha=0.4, label="Estimated 1D subspace plane")
+            )
+            legend_handles.append(
+                plt.Line2D([0], [0], color="tab:red", linewidth=2.5, label="Estimated 1D subspace line (z=0)")
             )
         ax.legend(handles=legend_handles, loc="upper left")
 
