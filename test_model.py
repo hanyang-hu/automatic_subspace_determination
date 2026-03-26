@@ -197,33 +197,31 @@ def visualize_results(
 
         z_low = min(train_y_denorm.min().item(), test_y_denorm.min().item(), zz_true.min().item())
         z_high = max(train_y_denorm.max().item(), test_y_denorm.max().item(), zz_true.max().item())
-        z_low -= 0.15 * (z_high - z_low + 1e-8)
-        z_high += 0.15 * (z_high - z_low + 1e-8)
-        z_range = torch.linspace(z_low, z_high, 50, device=all_x.device, dtype=all_x.dtype)
-        xy_radius = 0.7 * float(torch.linalg.vector_norm(x_max - x_min).item())
-
-        def _plot_vertical_plane(direction_xy: torch.Tensor, color: str, alpha: float, label_line: str):
-            direction_xy = direction_xy / torch.linalg.vector_norm(direction_xy).clamp_min(1e-12)
-            t = torch.linspace(-xy_radius, xy_radius, 30, device=direction_xy.device, dtype=direction_xy.dtype)
-            tt, zz = torch.meshgrid(t, z_range, indexing="xy")
-            px = (tt * direction_xy[0]).detach().cpu().numpy()
-            py = (tt * direction_xy[1]).detach().cpu().numpy()
-            pz = zz.detach().cpu().numpy()
-            ax.plot_surface(px, py, pz, color=color, alpha=alpha, linewidth=0, shade=False)
-            # draw the 1D subspace line at z=0 to make containment explicit
-            line_t = torch.linspace(-xy_radius, xy_radius, 120, device=direction_xy.device, dtype=direction_xy.dtype)
-            line_x = (line_t * direction_xy[0]).detach().cpu().numpy()
-            line_y = (line_t * direction_xy[1]).detach().cpu().numpy()
-            ax.plot(line_x, line_y, np.zeros_like(line_x), color=color, linewidth=2.5, label=label_line)
+        z_range = np.linspace(z_low, z_high, 40)
+        xy_radius = float(torch.linalg.vector_norm(x_max - x_min).item())
 
         w_true_2d = W_true[:2, 0]
         if torch.linalg.vector_norm(w_true_2d) > 0:
-            _plot_vertical_plane(w_true_2d, color="tab:green", alpha=0.22, label_line="True 1D subspace line")
+            w_true_2d = w_true_2d / torch.linalg.vector_norm(w_true_2d)
+            t_true = torch.linspace(-xy_radius, xy_radius, 2, device=w_true_2d.device, dtype=w_true_2d.dtype)
+            s_true = torch.tensor(z_range, device=w_true_2d.device, dtype=w_true_2d.dtype)
+            tt_true, ss_true = torch.meshgrid(t_true, s_true, indexing="xy")
+            px_true = (tt_true * w_true_2d[0]).detach().cpu().numpy()
+            py_true = (tt_true * w_true_2d[1]).detach().cpu().numpy()
+            pz_true = ss_true.detach().cpu().numpy()
+            ax.plot_surface(px_true, py_true, pz_true, color="tab:green", alpha=0.20, linewidth=0)
 
         if hasattr(model, "W") and model.W.shape[1] >= 1:
             w_est_2d = model.W.detach()[:2, 0]
             if torch.linalg.vector_norm(w_est_2d) > 0:
-                _plot_vertical_plane(w_est_2d, color="tab:red", alpha=0.22, label_line="Estimated 1D subspace line")
+                w_est_2d = w_est_2d / torch.linalg.vector_norm(w_est_2d)
+                t_est = torch.linspace(-xy_radius, xy_radius, 2, device=w_est_2d.device, dtype=w_est_2d.dtype)
+                s_est = torch.tensor(z_range, device=w_est_2d.device, dtype=w_est_2d.dtype)
+                tt_est, ss_est = torch.meshgrid(t_est, s_est, indexing="xy")
+                px_est = (tt_est * w_est_2d[0]).detach().cpu().numpy()
+                py_est = (tt_est * w_est_2d[1]).detach().cpu().numpy()
+                pz_est = ss_est.detach().cpu().numpy()
+                ax.plot_surface(px_est, py_est, pz_est, color="tab:red", alpha=0.20, linewidth=0)
 
         ax.set_xlabel("x")
         ax.set_ylabel("y")
