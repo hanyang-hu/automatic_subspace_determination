@@ -32,9 +32,9 @@ MODEL_REGISTRY = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", choices=MODEL_REGISTRY, default="composite")
-    parser.add_argument("--D", type=int, default=5, help="Ambient input dimension")
-    parser.add_argument("--k_true", type=int, default=2, help="True latent subspace dim")
-    parser.add_argument("--k_model", type=int, default=2, help="Model latent subspace dim")
+    parser.add_argument("--D", type=int, default=2, help="Ambient input dimension")
+    parser.add_argument("--k_true", type=int, default=1, help="True latent subspace dim")
+    parser.add_argument("--k_model", type=int, default=1, help="Model latent subspace dim")
     parser.add_argument("--n_train", type=int, default=200)
     parser.add_argument("--n_test", type=int, default=200)
     parser.add_argument("--noise_std", type=float, default=0.1)
@@ -45,7 +45,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent", default="smooth", choices=["linear", "smooth", "nonlinear"])
     parser.add_argument("--output_dir", type=Path, default=Path("artifacts"))
     parser.add_argument("--eps_alpha", type=float, default=0.01, help="Half-Cauchy prior scale for composite eps")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.D != 2:
+        raise ValueError("This visualization script expects a 2D input space. Please run with --D 2.")
+    if args.k_true != 1:
+        raise ValueError("Toy data generation is configured for a 1D true response subspace. Please run with --k_true 1.")
+    return args
 
 
 def split_parameter_groups(model: torch.nn.Module) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
@@ -193,11 +198,12 @@ def visualize_results(
         z_low = min(train_y_denorm.min().item(), test_y_denorm.min().item(), zz_true.min().item())
         z_high = max(train_y_denorm.max().item(), test_y_denorm.max().item(), zz_true.max().item())
         z_range = np.linspace(z_low, z_high, 40)
+        xy_radius = float(torch.linalg.vector_norm(x_max - x_min).item())
 
         w_true_2d = W_true[:2, 0]
         if torch.linalg.vector_norm(w_true_2d) > 0:
             w_true_2d = w_true_2d / torch.linalg.vector_norm(w_true_2d)
-            t_true = torch.linspace(-3.0, 3.0, 2, device=w_true_2d.device, dtype=w_true_2d.dtype)
+            t_true = torch.linspace(-xy_radius, xy_radius, 2, device=w_true_2d.device, dtype=w_true_2d.dtype)
             s_true = torch.tensor(z_range, device=w_true_2d.device, dtype=w_true_2d.dtype)
             tt_true, ss_true = torch.meshgrid(t_true, s_true, indexing="xy")
             px_true = (tt_true * w_true_2d[0]).detach().cpu().numpy()
@@ -209,7 +215,7 @@ def visualize_results(
             w_est_2d = model.W.detach()[:2, 0]
             if torch.linalg.vector_norm(w_est_2d) > 0:
                 w_est_2d = w_est_2d / torch.linalg.vector_norm(w_est_2d)
-                t_est = torch.linspace(-3.0, 3.0, 2, device=w_est_2d.device, dtype=w_est_2d.dtype)
+                t_est = torch.linspace(-xy_radius, xy_radius, 2, device=w_est_2d.device, dtype=w_est_2d.dtype)
                 s_est = torch.tensor(z_range, device=w_est_2d.device, dtype=w_est_2d.dtype)
                 tt_est, ss_est = torch.meshgrid(t_est, s_est, indexing="xy")
                 px_est = (tt_est * w_est_2d[0]).detach().cpu().numpy()
@@ -225,6 +231,7 @@ def visualize_results(
         legend_handles = [
             plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:blue", markersize=8, label="Train data"),
             plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:orange", markersize=8, label="Test data"),
+            plt.Line2D([0], [0], color="teal", linewidth=6, alpha=0.5, label="Ground-truth surface"),
             plt.Line2D([0], [0], color="tab:green", linewidth=6, alpha=0.4, label="True 1D subspace plane"),
         ]
         if hasattr(model, "W") and model.W.shape[1] >= 1:

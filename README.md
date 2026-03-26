@@ -29,7 +29,7 @@ pip install -r requirements.txt
 Example with the composite model:
 
 ```bash
-python test_model.py --model composite --D 5 --k_true 2 --k_model 2 --n_train 200 --n_test 200 --iters 300 --noise_std 0.1
+python test_model.py --model composite --D 2 --k_true 1 --k_model 1 --n_train 200 --n_test 200 --iters 300 --noise_std 0.1
 ```
 
 Switch models:
@@ -49,9 +49,9 @@ Optional flags:
 
 ## Data generation in `test_model.py`
 
-- Inputs are generated once with Sobol quasi-random samples on `[-2.5, 2.5]^D`, then randomly split into train/test.
+- Inputs are generated once with Sobol quasi-random samples on `[-2.5, 2.5]^2`, then randomly split into train/test.
 - Train and test therefore come from the same distribution (not disjoint regions).
-- Targets are normalized with train-set mean/std before GP fitting.
+- Targets are generated from a **1D true subspace** (`k_true=1`) in the 2D input and normalized with train-set mean/std before GP fitting.
 - Metrics report both normalized-scale RMSE and original-scale RMSE.
 
 ## Expected outputs
