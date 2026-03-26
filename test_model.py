@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--latent", default="smooth", choices=["linear", "smooth", "nonlinear"])
     parser.add_argument("--output_dir", type=Path, default=Path("artifacts"))
-    parser.add_argument("--eps_alpha", type=float, default=0.01, help="Half-Cauchy prior scale for composite eps")
+    parser.add_argument("--eps_alpha", type=float, default=1., help="Half-Cauchy prior scale for composite eps")
     args = parser.parse_args()
     if args.D != 2:
         raise ValueError("This visualization script expects a 2D input space. Please run with --D 2.")
@@ -73,6 +73,9 @@ def train_model(model, likelihood, train_x, train_y, iters: int, lr: float):
 
     mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
     losses = []
+    eps_lst = []
+
+    eps_lst.append(float(model.eps.detach().cpu())) if hasattr(model, "eps") else None
 
     for i in range(iters):
         euclidean_optim.zero_grad(set_to_none=True)
@@ -87,15 +90,20 @@ def train_model(model, likelihood, train_x, train_y, iters: int, lr: float):
         if manifold_optim is not None:
             manifold_optim.step()
 
+        if hasattr(model, "eps"):
+            eps_lst.append(float(model.eps.detach().cpu()))
+
         losses.append(float(loss.detach().cpu()))
 
         if (i + 1) % max(1, iters // 10) == 0:
             status = f"iter={i+1:04d}/{iters} loss={losses[-1]:.4f}"
             if manifold_params:
                 status += f" ortho_err={orthogonality_error(manifold_params[0]).item():.2e}"
+            if hasattr(model, "eps"):
+                status += f" eps={model.eps.item():.4f}"
             print(status)
 
-    return losses
+    return losses, eps_lst
 
 
 @torch.no_grad()
@@ -123,6 +131,7 @@ def visualize_results(
     test_y_denorm,
     pred_mean_denorm,
     losses,
+    eps_lst,
     W_true,
     latent_kind: str,
 ):
@@ -145,7 +154,7 @@ def visualize_results(
     ax.plot([mn, mx], [mn, mx], "k--", linewidth=1)
     ax.set_xlabel("Ground truth")
     ax.set_ylabel("Predicted mean")
-    ax.set_title(f"Prediction vs truth (original scale, {model_name})")
+    ax.set_title(f"Prediction vs truth ({model_name}, RMSE={torch.sqrt(torch.mean((pred_mean_denorm - test_y_denorm) ** 2)).item():.3f})")
     fig.tight_layout()
     fig.savefig(output_dir / f"pred_vs_truth_{model_name}.png", dpi=150)
     plt.close(fig)
@@ -226,22 +235,18 @@ def visualize_results(
         ax.set_xlabel("x")
         ax.set_ylabel("y")
         ax.set_zlabel("output")
-        ax.set_title("Ground-truth surface, data, and true/estimated 1D subspace planes")
+        ax.set_title("Ground-truth surface, data, and true/estimated 1D subspace")
         ax.view_init(elev=24, azim=-57)
 
         legend_handles = [
             plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:blue", markersize=8, label="Train data"),
             plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:orange", markersize=8, label="Test data"),
             plt.Line2D([0], [0], color="teal", linewidth=6, alpha=0.5, label="Ground-truth surface"),
-            plt.Line2D([0], [0], color="tab:green", linewidth=6, alpha=0.4, label="True 1D subspace plane"),
-            plt.Line2D([0], [0], color="tab:green", linewidth=2.5, label="True 1D subspace line (z=0)"),
+            plt.Line2D([0], [0], color="tab:green", linewidth=6, alpha=0.4, label="Ground-truth subspace"),
         ]
         if hasattr(model, "W") and model.W.shape[1] >= 1:
             legend_handles.append(
-                plt.Line2D([0], [0], color="tab:red", linewidth=6, alpha=0.4, label="Estimated 1D subspace plane")
-            )
-            legend_handles.append(
-                plt.Line2D([0], [0], color="tab:red", linewidth=2.5, label="Estimated 1D subspace line (z=0)")
+                plt.Line2D([0], [0], color="tab:red", linewidth=6, alpha=0.4, label="Estimated subspace")
             )
         ax.legend(handles=legend_handles, loc="upper left")
 
@@ -296,6 +301,17 @@ def visualize_results(
         fig.savefig(output_dir / f"subspace_overlap_{model_name}.png", dpi=150)
         plt.close(fig)
 
+    # Plot eps trajectory for composite model.
+    if eps_lst:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(eps_lst)
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("eps")
+        ax.set_title(f"Gating parameter eps (alpha=1.0)")
+        fig.tight_layout()
+        fig.savefig(output_dir / f"eps_trajectory_{model_name}.png", dpi=150)
+        plt.close(fig)
+
 
 def main() -> None:
     args = parse_args()
@@ -333,7 +349,7 @@ def main() -> None:
 
     model = model_cls(**model_kwargs).to(device)
 
-    losses = train_model(model, likelihood, train_x, train_y, iters=args.iters, lr=args.lr)
+    losses, eps_lst = train_model(model, likelihood, train_x, train_y, iters=args.iters, lr=args.lr)
     rmse, nll, pred_mean, _ = evaluate_model(model, likelihood, test_x, test_y)
     pred_mean_denorm = pred_mean * train_y_std + train_y_mean
     rmse_denorm = torch.sqrt(torch.mean((pred_mean_denorm - test_y_raw) ** 2)).item()
@@ -363,6 +379,7 @@ def main() -> None:
         test_y_raw,
         pred_mean_denorm,
         losses,
+        eps_lst,
         W_true,
         args.latent,
     )
