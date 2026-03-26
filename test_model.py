@@ -11,13 +11,24 @@ import numpy as np
 import torch
 
 from manifold_optim import RiemannianAdam
-from models import CompositeGPModel, ProjectedGPModel, StandardGPModel
-from utils import make_linear_subspace_train_test_split, orthogonality_error, set_seed
+from models import (
+    CompositeGPModel,
+    LinearEmbeddingGPModel,
+    ProjectedGPModel,
+    StandardGPModel,
+)
+from utils import (
+    make_latent_function,
+    make_linear_subspace_train_test_split,
+    orthogonality_error,
+    set_seed,
+)
 
 
 MODEL_REGISTRY = {
     "standard": StandardGPModel,
     "projected": ProjectedGPModel,
+    "linear_embedding": LinearEmbeddingGPModel,
     "composite": CompositeGPModel,
 }
 
@@ -37,13 +48,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--latent", default="smooth", choices=["linear", "smooth", "nonlinear"])
     parser.add_argument("--output_dir", type=Path, default=Path("artifacts"))
-    parser.add_argument("--eps_alpha", type=float, default=0.1, help="Half-Cauchy prior scale for composite eps")
+    parser.add_argument("--eps_alpha", type=float, default=0.01, help="Half-Cauchy prior scale for composite eps")
     return parser.parse_args()
 
 
 def split_parameter_groups(model: torch.nn.Module) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
     manifold_params: list[torch.nn.Parameter] = []
-    if hasattr(model, "W"):
+    if hasattr(model, "W") and getattr(model, "uses_riemannian_projection", False):
         manifold_params.append(model.W)
 
     manifold_ids = {id(p) for p in manifold_params}
@@ -105,11 +116,14 @@ def visualize_results(
     output_dir: Path,
     model_name: str,
     model,
+    train_x,
+    train_y_denorm,
     test_x,
     test_y_denorm,
     pred_mean_denorm,
     losses,
     W_true,
+    latent_kind: str,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -135,53 +149,97 @@ def visualize_results(
     fig.savefig(output_dir / f"pred_vs_truth_{model_name}.png", dpi=150)
     plt.close(fig)
 
-    # Visualize objective value + response in true/estimated subspaces.
-    fig = plt.figure(figsize=(12, 8))
-    gs = fig.add_gridspec(2, 2)
-    ax_loss = fig.add_subplot(gs[0, :])
-    ax_loss.plot(losses)
-    ax_loss.set_xlabel("Iteration")
-    ax_loss.set_ylabel("-MLL loss")
-    ax_loss.set_title(f"Objective function trajectory ({model_name})")
+    if train_x.shape[-1] == 2 and W_true.shape[-1] == 1 and hasattr(model, "W"):
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection="3d")
 
-    def _to_3d_coords(arr: torch.Tensor) -> np.ndarray:
-        cols = min(2, arr.shape[-1])
-        out = torch.zeros(arr.shape[0], 3, device=arr.device, dtype=arr.dtype)
-        out[:, :cols] = arr[:, :cols]
-        return out.cpu().numpy()
+        # Ground-truth surface y = g(W_true^T x) on a 2D grid in input space.
+        grid = torch.linspace(-2.5, 2.5, 80, device=train_x.device, dtype=train_x.dtype)
+        xx, yy = torch.meshgrid(grid, grid, indexing="xy")
+        grid_x = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)
+        g = make_latent_function(latent_kind)
+        zz = g(grid_x @ W_true).reshape(xx.shape)
 
-    z_true = test_x @ W_true
-    pts_true = _to_3d_coords(z_true)
-    pts_true[:, 2] = test_y_denorm.detach().cpu().numpy()
-    ax_true = fig.add_subplot(gs[1, 0], projection="3d")
-    sc_true = ax_true.scatter(pts_true[:, 0], pts_true[:, 1], pts_true[:, 2], c=pts_true[:, 2], s=12, cmap="viridis")
-    ax_true.set_xlabel("true z1")
-    ax_true.set_ylabel("true z2")
-    ax_true.set_zlabel("y")
-    ax_true.set_title("Ground-truth response on true subspace")
-    fig.colorbar(sc_true, ax=ax_true, shrink=0.7, pad=0.1)
+        ax.plot_surface(
+            xx.cpu().numpy(),
+            yy.cpu().numpy(),
+            zz.detach().cpu().numpy(),
+            cmap="viridis",
+            alpha=0.35,
+            linewidth=0,
+            antialiased=True,
+        )
 
-    if hasattr(model, "W"):
-        z_est = test_x @ model.W.detach()
+        # Training and test points in different colors.
+        ax.scatter(
+            train_x[:, 0].cpu().numpy(),
+            train_x[:, 1].cpu().numpy(),
+            train_y_denorm.cpu().numpy(),
+            c="tab:blue",
+            s=14,
+            alpha=0.8,
+            label="train",
+        )
+        ax.scatter(
+            test_x[:, 0].cpu().numpy(),
+            test_x[:, 1].cpu().numpy(),
+            test_y_denorm.cpu().numpy(),
+            c="tab:orange",
+            s=14,
+            alpha=0.8,
+            label="test",
+        )
+
+        def _plot_subspace_plane(w_vec: torch.Tensor, color: str, label: str) -> None:
+            w = w_vec / w_vec.norm().clamp_min(1e-8)
+            x_lim = np.array([-2.5, 2.5], dtype=np.float32)
+            y_lim = np.array([-2.5, 2.5], dtype=np.float32)
+            Xp, Yp = np.meshgrid(x_lim, y_lim)
+            if abs(float(w[1])) > 1e-6:
+                Yp = (float(w[1]) / float(w[0])) * Xp if abs(float(w[0])) > 1e-6 else np.zeros_like(Xp)
+            else:
+                Xp = np.zeros_like(Yp)
+            z_min = float(min(train_y_denorm.min(), test_y_denorm.min()).item())
+            z_max = float(max(train_y_denorm.max(), test_y_denorm.max()).item())
+            Zp = np.array([[z_min, z_min], [z_max, z_max]], dtype=np.float32)
+            Xp = np.tile(Xp[0:1, :], (2, 1))
+            Yp = np.tile(Yp[0:1, :], (2, 1))
+            ax.plot_surface(Xp, Yp, Zp, color=color, alpha=0.25, linewidth=0, shade=False)
+            ax.plot([], [], [], color=color, linewidth=6, alpha=0.45, label=label)
+
+        _plot_subspace_plane(W_true[:, 0].detach(), "tab:green", "true 1D subspace plane")
+
+        est_w = model.W.detach()[:, 0]
+        if est_w.numel() > 2:
+            est_w = est_w[:2]
+        _plot_subspace_plane(est_w, "tab:red", "estimated 1D subspace plane")
+
+        ax.set_xlabel("x1")
+        ax.set_ylabel("x2")
+        ax.set_zlabel("y")
+        ax.set_title(f"Ground-truth surface + true/estimated 1D subspace planes ({model_name})")
+        ax.legend(loc="upper left")
+        fig.tight_layout()
+        fig.savefig(output_dir / f"subspace_visualization_{model_name}.png", dpi=150)
+        plt.close(fig)
     else:
-        z_est = test_x[:, : W_true.shape[-1]]
-    pts_est = _to_3d_coords(z_est)
-    pts_est[:, 2] = pred_mean_denorm.detach().cpu().numpy()
-    ax_est = fig.add_subplot(gs[1, 1], projection="3d")
-    sc_est = ax_est.scatter(pts_est[:, 0], pts_est[:, 1], pts_est[:, 2], c=pts_est[:, 2], s=12, cmap="plasma")
-    ax_est.set_xlabel("estimated z1")
-    ax_est.set_ylabel("estimated z2")
-    ax_est.set_zlabel("pred y")
-    ax_est.set_title("Predicted response on estimated subspace")
-    fig.colorbar(sc_est, ax=ax_est, shrink=0.7, pad=0.1)
-
-    fig.tight_layout()
-    fig.savefig(output_dir / f"objective_and_subspace_response_{model_name}.png", dpi=150)
-    plt.close(fig)
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.text(
+            0.5,
+            0.5,
+            "3D subspace-plane plot requires D=2,\ntrue subspace dim=1, and learned W.",
+            ha="center",
+            va="center",
+        )
+        ax.set_axis_off()
+        fig.tight_layout()
+        fig.savefig(output_dir / f"subspace_visualization_{model_name}.png", dpi=150)
+        plt.close(fig)
 
     if hasattr(model, "W"):
         fig, ax = plt.subplots(figsize=(5, 4))
-        overlap = (W_true.transpose(-2, -1) @ model.W.detach()).abs().cpu().numpy()
+        est_basis, _ = torch.linalg.qr(model.W.detach())
+        overlap = (W_true.transpose(-2, -1) @ est_basis).abs().cpu().numpy()
         im = ax.imshow(overlap, cmap="magma", vmin=0.0, vmax=1.0)
         ax.set_xlabel("Estimated basis index")
         ax.set_ylabel("True basis index")
@@ -240,9 +298,11 @@ def main() -> None:
 
     if hasattr(model, "W"):
         est_W = model.W.detach()
-        overlap = torch.linalg.matrix_norm(W_true.transpose(-2, -1) @ est_W, ord=2).item()
+        est_basis, _ = torch.linalg.qr(est_W)
+        overlap = torch.linalg.matrix_norm(W_true.transpose(-2, -1) @ est_basis, ord=2).item()
         print(f"Subspace overlap spectral norm: {overlap:.4f}")
-        print(f"Orthogonality error (W): {orthogonality_error(est_W).item():.3e}")
+        if getattr(model, "uses_riemannian_projection", False):
+            print(f"Orthogonality error (W): {orthogonality_error(est_W).item():.3e}")
     if hasattr(model, "eps"):
         print(f"Composite eps: {model.eps.item():.4f}")
 
@@ -250,11 +310,14 @@ def main() -> None:
         args.output_dir,
         args.model,
         model,
+        train_x,
+        train_y_raw,
         test_x,
         test_y_raw,
         pred_mean_denorm,
         losses,
         W_true,
+        args.latent,
     )
     print(f"Saved artifacts to: {args.output_dir.resolve()}")
 
