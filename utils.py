@@ -113,9 +113,15 @@ def make_linear_subspace_train_test_split(
     )
     W_true = q[:, :subspace_dim]
 
-    z = x @ W_true
-    g = make_latent_function(latent_kind)
-    y_clean = g(z)
+    # print(latent_kind)
+    if latent_kind != "nonlowdim":
+        z = x @ W_true
+        g = make_latent_function(latent_kind)
+        y_clean = g(z)
+    else:
+        # For the nonlowdim case, we want to generate targets that depend on all input dimensions,
+        y_clean = torch.sin(x).sum(dim=-1)
+
     y = y_clean + noise_std * torch.randn_like(y_clean)
 
     perm = torch.randperm(n_total, device=device)
