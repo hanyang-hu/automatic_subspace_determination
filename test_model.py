@@ -9,6 +9,7 @@ import gpytorch
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 from manifold_optim import RiemannianAdam
 from models import (
@@ -17,7 +18,7 @@ from models import (
     ProjectedGPModel,
     StandardGPModel,
 )
-from utils import make_linear_subspace_train_test_split, orthogonality_error, set_seed
+from utils import make_latent_function, make_linear_subspace_train_test_split, orthogonality_error, set_seed
 
 
 MODEL_REGISTRY = {
@@ -111,11 +112,14 @@ def visualize_results(
     output_dir: Path,
     model_name: str,
     model,
+    train_x,
+    train_y_denorm,
     test_x,
     test_y_denorm,
     pred_mean_denorm,
     losses,
     W_true,
+    latent_kind: str,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -141,40 +145,131 @@ def visualize_results(
     fig.savefig(output_dir / f"pred_vs_truth_{model_name}.png", dpi=150)
     plt.close(fig)
 
-    # Visualize subspace coordinates directly (true vs estimated linear subspace).
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    if train_x.shape[1] == 2 and W_true.shape[1] >= 1:
+        fig = plt.figure(figsize=(9, 7))
+        ax = fig.add_subplot(111, projection="3d")
 
-    def _to_2d_coords(arr: torch.Tensor) -> np.ndarray:
-        cols = min(2, arr.shape[-1])
-        out = torch.zeros(arr.shape[0], 2, device=arr.device, dtype=arr.dtype)
-        out[:, :cols] = arr[:, :cols]
-        return out.cpu().numpy()
+        all_x = torch.cat([train_x, test_x], dim=0)
+        x_min, _ = all_x.min(dim=0)
+        x_max, _ = all_x.max(dim=0)
+        margin = 0.3
+        x1 = torch.linspace(x_min[0] - margin, x_max[0] + margin, 60, device=all_x.device, dtype=all_x.dtype)
+        x2 = torch.linspace(x_min[1] - margin, x_max[1] + margin, 60, device=all_x.device, dtype=all_x.dtype)
+        xx, yy = torch.meshgrid(x1, x2, indexing="xy")
+        grid_xy = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)
 
-    y_np = test_y_denorm.detach().cpu().numpy()
-    z_true = test_x @ W_true
-    pts_true = _to_2d_coords(z_true)
-    ax_true = axes[0]
-    sc_true = ax_true.scatter(pts_true[:, 0], pts_true[:, 1], c=y_np, s=14, cmap="viridis")
-    ax_true.set_xlabel("true z1")
-    ax_true.set_ylabel("true z2")
-    ax_true.set_title("Ground-truth subspace (color = true y)")
-    fig.colorbar(sc_true, ax=ax_true, shrink=0.7, pad=0.1)
+        latent_fn = make_latent_function(latent_kind)
+        zz_true = latent_fn(grid_xy @ W_true).reshape(xx.shape)
 
-    if hasattr(model, "W"):
-        z_est = test_x @ model.W.detach()
+        ax.plot_surface(
+            xx.detach().cpu().numpy(),
+            yy.detach().cpu().numpy(),
+            zz_true.detach().cpu().numpy(),
+            cmap="viridis",
+            alpha=0.55,
+            linewidth=0.0,
+            antialiased=True,
+        )
+
+        ax.scatter(
+            train_x[:, 0].detach().cpu().numpy(),
+            train_x[:, 1].detach().cpu().numpy(),
+            train_y_denorm.detach().cpu().numpy(),
+            c="tab:blue",
+            s=20,
+            alpha=0.9,
+            label="Train data",
+        )
+        ax.scatter(
+            test_x[:, 0].detach().cpu().numpy(),
+            test_x[:, 1].detach().cpu().numpy(),
+            test_y_denorm.detach().cpu().numpy(),
+            c="tab:orange",
+            s=20,
+            alpha=0.9,
+            label="Test data",
+        )
+
+        z_low = min(train_y_denorm.min().item(), test_y_denorm.min().item(), zz_true.min().item())
+        z_high = max(train_y_denorm.max().item(), test_y_denorm.max().item(), zz_true.max().item())
+        z_range = np.linspace(z_low, z_high, 40)
+
+        w_true_2d = W_true[:2, 0]
+        if torch.linalg.vector_norm(w_true_2d) > 0:
+            w_true_2d = w_true_2d / torch.linalg.vector_norm(w_true_2d)
+            t_true = torch.linspace(-3.0, 3.0, 2, device=w_true_2d.device, dtype=w_true_2d.dtype)
+            s_true = torch.tensor(z_range, device=w_true_2d.device, dtype=w_true_2d.dtype)
+            tt_true, ss_true = torch.meshgrid(t_true, s_true, indexing="xy")
+            px_true = (tt_true * w_true_2d[0]).detach().cpu().numpy()
+            py_true = (tt_true * w_true_2d[1]).detach().cpu().numpy()
+            pz_true = ss_true.detach().cpu().numpy()
+            ax.plot_surface(px_true, py_true, pz_true, color="tab:green", alpha=0.20, linewidth=0)
+
+        if hasattr(model, "W") and model.W.shape[1] >= 1:
+            w_est_2d = model.W.detach()[:2, 0]
+            if torch.linalg.vector_norm(w_est_2d) > 0:
+                w_est_2d = w_est_2d / torch.linalg.vector_norm(w_est_2d)
+                t_est = torch.linspace(-3.0, 3.0, 2, device=w_est_2d.device, dtype=w_est_2d.dtype)
+                s_est = torch.tensor(z_range, device=w_est_2d.device, dtype=w_est_2d.dtype)
+                tt_est, ss_est = torch.meshgrid(t_est, s_est, indexing="xy")
+                px_est = (tt_est * w_est_2d[0]).detach().cpu().numpy()
+                py_est = (tt_est * w_est_2d[1]).detach().cpu().numpy()
+                pz_est = ss_est.detach().cpu().numpy()
+                ax.plot_surface(px_est, py_est, pz_est, color="tab:red", alpha=0.20, linewidth=0)
+
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_zlabel("output")
+        ax.set_title("Ground-truth surface, data, and true/estimated 1D subspace planes")
+
+        legend_handles = [
+            plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:blue", markersize=8, label="Train data"),
+            plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="tab:orange", markersize=8, label="Test data"),
+            plt.Line2D([0], [0], color="tab:green", linewidth=6, alpha=0.4, label="True 1D subspace plane"),
+        ]
+        if hasattr(model, "W") and model.W.shape[1] >= 1:
+            legend_handles.append(
+                plt.Line2D([0], [0], color="tab:red", linewidth=6, alpha=0.4, label="Estimated 1D subspace plane")
+            )
+        ax.legend(handles=legend_handles, loc="upper left")
+
+        fig.tight_layout()
+        fig.savefig(output_dir / f"subspace_visualization_{model_name}.png", dpi=150)
+        plt.close(fig)
     else:
-        z_est = test_x[:, : W_true.shape[-1]]
-    pts_est = _to_2d_coords(z_est)
-    ax_est = axes[1]
-    sc_est = ax_est.scatter(pts_est[:, 0], pts_est[:, 1], c=y_np, s=14, cmap="plasma")
-    ax_est.set_xlabel("estimated z1")
-    ax_est.set_ylabel("estimated z2")
-    ax_est.set_title("Estimated linear subspace (color = true y)")
-    fig.colorbar(sc_est, ax=ax_est, shrink=0.7, pad=0.1)
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-    fig.tight_layout()
-    fig.savefig(output_dir / f"subspace_visualization_{model_name}.png", dpi=150)
-    plt.close(fig)
+        def _to_2d_coords(arr: torch.Tensor) -> np.ndarray:
+            cols = min(2, arr.shape[-1])
+            out = torch.zeros(arr.shape[0], 2, device=arr.device, dtype=arr.dtype)
+            out[:, :cols] = arr[:, :cols]
+            return out.cpu().numpy()
+
+        y_np = test_y_denorm.detach().cpu().numpy()
+        z_true = test_x @ W_true
+        pts_true = _to_2d_coords(z_true)
+        ax_true = axes[0]
+        sc_true = ax_true.scatter(pts_true[:, 0], pts_true[:, 1], c=y_np, s=14, cmap="viridis")
+        ax_true.set_xlabel("true z1")
+        ax_true.set_ylabel("true z2")
+        ax_true.set_title("Ground-truth subspace (color = true y)")
+        fig.colorbar(sc_true, ax=ax_true, shrink=0.7, pad=0.1)
+
+        if hasattr(model, "W"):
+            z_est = test_x @ model.W.detach()
+        else:
+            z_est = test_x[:, : W_true.shape[-1]]
+        pts_est = _to_2d_coords(z_est)
+        ax_est = axes[1]
+        sc_est = ax_est.scatter(pts_est[:, 0], pts_est[:, 1], c=y_np, s=14, cmap="plasma")
+        ax_est.set_xlabel("estimated z1")
+        ax_est.set_ylabel("estimated z2")
+        ax_est.set_title("Estimated linear subspace (color = true y)")
+        fig.colorbar(sc_est, ax=ax_est, shrink=0.7, pad=0.1)
+
+        fig.tight_layout()
+        fig.savefig(output_dir / f"subspace_visualization_{model_name}.png", dpi=150)
+        plt.close(fig)
 
     if hasattr(model, "W"):
         fig, ax = plt.subplots(figsize=(5, 4))
@@ -250,11 +345,14 @@ def main() -> None:
         args.output_dir,
         args.model,
         model,
+        train_x,
+        train_y_raw,
         test_x,
         test_y_raw,
         pred_mean_denorm,
         losses,
         W_true,
+        args.latent,
     )
     print(f"Saved artifacts to: {args.output_dir.resolve()}")
 
