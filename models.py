@@ -11,7 +11,8 @@ from gpytorch.constraints import Positive
 from gpytorch.priors import HalfCauchyPrior
 
 
-DEFAULT_EPS_ALPHA = 0.1
+DEFAULT_EPS_ALPHA = 0.01
+DEFAULT_EPS_INIT = 0.01
 
 
 def _initialize_kernel_lengthscale(kernel: gpytorch.kernels.Kernel, dim: int) -> None:
@@ -74,6 +75,56 @@ class ProjectedKernel(gpytorch.kernels.Kernel):
         return self.base_kernel(x1_proj, x2_proj, diag=diag, **params)
 
 
+class LinearEmbeddingKernel(gpytorch.kernels.Kernel):
+    """Kernel wrapper that linearly embeds inputs without Stiefel constraints."""
+
+    has_lengthscale = False
+
+    def __init__(
+        self,
+        input_dim: int,
+        embedding_dim: int,
+        base_kernel: Optional[gpytorch.kernels.Kernel] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        if embedding_dim > input_dim:
+            raise ValueError("embedding_dim must be <= input_dim")
+
+        self.input_dim = input_dim
+        self.embedding_dim = embedding_dim
+        self.base_kernel = base_kernel or gpytorch.kernels.RBFKernel(
+            ard_num_dims=embedding_dim,
+            lengthscale_constraint=Positive(),
+        )
+        _initialize_kernel_lengthscale(self.base_kernel, embedding_dim)
+
+        self.register_parameter(
+            name="A",
+            parameter=torch.nn.Parameter(
+                torch.randn(input_dim, embedding_dim) / math.sqrt(input_dim)
+            ),
+        )
+
+    def embed(self, x: torch.Tensor) -> torch.Tensor:
+        if x.size(-1) != self.input_dim:
+            raise ValueError(
+                f"Expected input dimension {self.input_dim}, got {x.size(-1)}"
+            )
+        return x @ self.A
+
+    def forward(
+        self,
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        diag: bool = False,
+        **params,
+    ) -> torch.Tensor:
+        x1_emb = self.embed(x1)
+        x2_emb = self.embed(x2)
+        return self.base_kernel(x1_emb, x2_emb, diag=diag, **params)
+
+
 class CompositeKernel(gpytorch.kernels.Kernel):
     """Composite kernel with projected and residual full-space terms."""
 
@@ -100,10 +151,7 @@ class CompositeKernel(gpytorch.kernels.Kernel):
         )
         _initialize_kernel_lengthscale(self.residual_kernel, input_dim)
 
-        self.register_parameter(
-            name="raw_eps", parameter=torch.nn.Parameter(torch.tensor(0.0))
-        )
-        self.register_constraint("raw_eps", Positive())
+        self._ensure_raw_eps()
         self.register_prior(
             "eps_prior",
             HalfCauchyPrior(scale=eps_alpha),
@@ -111,11 +159,24 @@ class CompositeKernel(gpytorch.kernels.Kernel):
             lambda m, v: m._set_eps(v),
         )
 
+    def _ensure_raw_eps(self) -> None:
+        """Ensure ``raw_eps`` exists for compatibility with older objects/state."""
+        if "raw_eps" not in self._parameters:
+            positive = Positive()
+            init_raw_eps = positive.inverse_transform(torch.tensor(DEFAULT_EPS_INIT))
+            self.register_parameter(
+                name="raw_eps", parameter=torch.nn.Parameter(init_raw_eps)
+            )
+        if "raw_eps_constraint" not in self._constraints:
+            self.register_constraint("raw_eps", Positive())
+
     @property
     def eps(self) -> torch.Tensor:
+        self._ensure_raw_eps()
         return self.raw_eps_constraint.transform(self.raw_eps)
 
     def _set_eps(self, value: torch.Tensor | float) -> None:
+        self._ensure_raw_eps()
         if not torch.is_tensor(value):
             value = torch.as_tensor(
                 value, dtype=self.raw_eps.dtype, device=self.raw_eps.device
@@ -210,6 +271,43 @@ class ProjectedGPModel(_BaseExactGP):
     def W(self) -> torch.nn.Parameter:
         return self.covar_module.base_kernel.W
 
+    @property
+    def is_stiefel(self) -> bool:
+        return True
+
+    def manifold_parameters(self) -> list[torch.nn.Parameter]:
+        return [self.W]
+
+
+class LinearEmbeddingGPModel(_BaseExactGP):
+    """Exact GP with an unconstrained learned linear embedding."""
+
+    def __init__(
+        self,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        likelihood: gpytorch.likelihoods.GaussianLikelihood,
+        input_dim: int,
+        subspace_dim: int,
+    ) -> None:
+        super().__init__(train_x, train_y, likelihood)
+
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            LinearEmbeddingKernel(input_dim=input_dim, embedding_dim=subspace_dim),
+            outputscale_constraint=Positive(),
+        )
+
+    @property
+    def W(self) -> torch.nn.Parameter:
+        return self.covar_module.base_kernel.A
+
+    @property
+    def is_stiefel(self) -> bool:
+        return False
+
+    def manifold_parameters(self) -> list[torch.nn.Parameter]:
+        return []
+
 
 class CompositeGPModel(_BaseExactGP):
     """Exact GP with projected + epsilon-weighted full-space residual kernel."""
@@ -241,3 +339,10 @@ class CompositeGPModel(_BaseExactGP):
     @property
     def eps(self) -> torch.Tensor:
         return self.covar_module.base_kernel.eps
+
+    @property
+    def is_stiefel(self) -> bool:
+        return True
+
+    def manifold_parameters(self) -> list[torch.nn.Parameter]:
+        return [self.W]

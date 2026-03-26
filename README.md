@@ -4,6 +4,7 @@ This repository provides Gaussian Process (GP) models for subspace-aware regress
 
 - **Standard GP** (`StandardGPModel`): full-space RBF kernel.
 - **Projected GP** (`ProjectedGPModel`): kernel on learned projected coordinates `xW`.
+- **Linear-embedding GP** (`LinearEmbeddingGPModel`): kernel on learned unconstrained linear embedding `xA`.
 - **Composite GP** (`CompositeGPModel`): projected kernel plus an `eps`-weighted full-space residual kernel.
 
 It also includes a **Riemannian Adam** optimizer for Stiefel-constrained projection matrices using tangent projection + QR retraction.
@@ -18,8 +19,8 @@ It also includes a **Riemannian Adam** optimizer for Stiefel-constrained project
 ## Installation
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+conda create -n asd-gp python=3.11 -y
+conda activate asd-gp
 pip install -r requirements.txt
 ```
 
@@ -36,6 +37,7 @@ Switch models:
 ```bash
 python test_model.py --model standard
 python test_model.py --model projected
+python test_model.py --model linear_embed
 python test_model.py --model composite
 ```
 
@@ -51,7 +53,8 @@ The script saves plots under `artifacts/`:
 
 - `loss_curve_<model>.png`
 - `pred_vs_truth_<model>.png`
-- `surface_slice_<model>.png` (for ambient dimension >= 2)
+- `subspace_bases_<model>.png` (for subspace-capable models)
+- `surface_true_vs_est_<model>.png` (for models with at least 2 learned subspace dimensions)
 
 and prints summary metrics:
 
@@ -64,4 +67,4 @@ and prints summary metrics:
 
 - `W` is initialized on the Stiefel manifold using QR.
 - `RiemannianAdam` projects Adam directions onto the tangent space and retracts with QR.
-- A Half-Cauchy prior is attached only to the composite gating parameter `eps` (default scale `alpha=0.1`).
+- A Half-Cauchy prior is attached only to the composite gating parameter `eps` (default scale `alpha=0.01`).

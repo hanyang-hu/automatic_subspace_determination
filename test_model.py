@@ -10,13 +10,20 @@ import matplotlib.pyplot as plt
 import torch
 
 from manifold_optim import RiemannianAdam
-from models import CompositeGPModel, ProjectedGPModel, StandardGPModel
+from models import (
+    DEFAULT_EPS_ALPHA,
+    CompositeGPModel,
+    LinearEmbeddingGPModel,
+    ProjectedGPModel,
+    StandardGPModel,
+)
 from utils import make_linear_subspace_data, orthogonality_error, set_seed
 
 
 MODEL_REGISTRY = {
     "standard": StandardGPModel,
     "projected": ProjectedGPModel,
+    "linear_embed": LinearEmbeddingGPModel,
     "composite": CompositeGPModel,
 }
 
@@ -36,14 +43,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--latent", default="smooth", choices=["linear", "smooth", "nonlinear"])
     parser.add_argument("--output_dir", type=Path, default=Path("artifacts"))
-    parser.add_argument("--eps_alpha", type=float, default=0.1, help="Half-Cauchy prior scale for composite eps")
+    parser.add_argument(
+        "--eps_alpha",
+        type=float,
+        default=DEFAULT_EPS_ALPHA,
+        help="Half-Cauchy prior scale for composite eps",
+    )
     return parser.parse_args()
 
 
 def split_parameter_groups(model: torch.nn.Module) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
-    manifold_params: list[torch.nn.Parameter] = []
-    if hasattr(model, "W"):
-        manifold_params.append(model.W)
+    if hasattr(model, "manifold_parameters"):
+        manifold_params = list(model.manifold_parameters())
+    elif hasattr(model, "W") and getattr(model, "is_stiefel", False):
+        manifold_params = [model.W]
+    else:
+        manifold_params = []
 
     manifold_ids = {id(p) for p in manifold_params}
     euclidean_params = [p for p in model.parameters() if p.requires_grad and id(p) not in manifold_ids]
@@ -100,7 +115,19 @@ def evaluate_model(model, likelihood, test_x, test_y):
 
 
 @torch.no_grad()
-def visualize_results(output_dir: Path, model_name: str, train_x, train_y, test_x, test_y, pred_mean, losses):
+def visualize_results(
+    output_dir: Path,
+    model_name: str,
+    model,
+    train_x,
+    train_y,
+    test_x,
+    test_y,
+    pred_mean,
+    losses,
+    W_true: torch.Tensor,
+    est_subspace: torch.Tensor | None,
+):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(6, 4))
@@ -125,28 +152,53 @@ def visualize_results(output_dir: Path, model_name: str, train_x, train_y, test_
     fig.savefig(output_dir / f"pred_vs_truth_{model_name}.png", dpi=150)
     plt.close(fig)
 
-    # For D>=2, visualize a 2D response slice with remaining dimensions fixed to 0.
-    if test_x.shape[-1] >= 2:
-        grid_n = 60
-        x1 = torch.linspace(-2.5, 2.5, grid_n, device=test_x.device)
-        x2 = torch.linspace(-2.5, 2.5, grid_n, device=test_x.device)
-        xx1, xx2 = torch.meshgrid(x1, x2, indexing="ij")
+    # Visualize true vs estimated subspace bases.
+    if est_subspace is not None:
+        fig, axes = plt.subplots(1, 2, figsize=(9, 4), sharey=True)
+        im0 = axes[0].imshow(W_true.cpu().numpy(), aspect="auto", cmap="coolwarm")
+        axes[0].set_title("Ground-truth subspace basis")
+        axes[0].set_xlabel("Basis index")
+        axes[0].set_ylabel("Ambient dimension")
+        fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
 
-        x_grid = torch.zeros(grid_n * grid_n, test_x.shape[-1], device=test_x.device)
-        x_grid[:, 0] = xx1.reshape(-1)
-        x_grid[:, 1] = xx2.reshape(-1)
+        im1 = axes[1].imshow(est_subspace.cpu().numpy(), aspect="auto", cmap="coolwarm")
+        axes[1].set_title("Estimated subspace basis")
+        axes[1].set_xlabel("Basis index")
+        fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+        fig.tight_layout()
+        fig.savefig(output_dir / f"subspace_bases_{model_name}.png", dpi=150)
+        plt.close(fig)
+
+    # Visualize model response on true/estimated 2D subspace coordinates.
+    if W_true.shape[-1] >= 2 and est_subspace is not None and est_subspace.shape[-1] >= 2:
+        grid_n = 60
+        z1 = torch.linspace(-2.5, 2.5, grid_n, device=test_x.device)
+        z2 = torch.linspace(-2.5, 2.5, grid_n, device=test_x.device)
+        zz1, zz2 = torch.meshgrid(z1, z2, indexing="ij")
+        z_grid = torch.stack([zz1.reshape(-1), zz2.reshape(-1)], dim=-1)
+
+        x_true_grid = z_grid @ W_true[:, :2].transpose(-2, -1)
+        x_est_grid = z_grid @ est_subspace[:, :2].transpose(-2, -1)
 
         model.eval()
-        pred_grid = model(x_grid).mean.reshape(grid_n, grid_n).cpu().numpy()
+        pred_true_grid = model(x_true_grid).mean.reshape(grid_n, grid_n).cpu().numpy()
+        pred_est_grid = model(x_est_grid).mean.reshape(grid_n, grid_n).cpu().numpy()
 
-        fig, ax = plt.subplots(figsize=(6, 5))
-        pcm = ax.pcolormesh(xx1.cpu().numpy(), xx2.cpu().numpy(), pred_grid, shading="auto")
-        fig.colorbar(pcm, ax=ax, label="Predicted response")
-        ax.set_xlabel("x[0]")
-        ax.set_ylabel("x[1]")
-        ax.set_title(f"Predicted response surface slice ({model_name})")
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), sharex=True, sharey=True)
+        pcm0 = axes[0].pcolormesh(zz1.cpu().numpy(), zz2.cpu().numpy(), pred_true_grid, shading="auto")
+        fig.colorbar(pcm0, ax=axes[0], label="Predicted response")
+        axes[0].set_xlabel("z[0]")
+        axes[0].set_ylabel("z[1]")
+        axes[0].set_title("Response on ground-truth subspace")
+
+        pcm1 = axes[1].pcolormesh(zz1.cpu().numpy(), zz2.cpu().numpy(), pred_est_grid, shading="auto")
+        fig.colorbar(pcm1, ax=axes[1], label="Predicted response")
+        axes[1].set_xlabel("z[0]")
+        axes[1].set_ylabel("z[1]")
+        axes[1].set_title("Response on estimated subspace")
         fig.tight_layout()
-        fig.savefig(output_dir / f"surface_slice_{model_name}.png", dpi=150)
+        fig.savefig(output_dir / f"surface_true_vs_est_{model_name}.png", dpi=150)
         plt.close(fig)
 
 
@@ -196,23 +248,33 @@ def main() -> None:
     print(f"RMSE: {rmse:.4f}")
     print(f"NLL / sample: {nll:.4f}")
 
+    est_subspace = None
     if hasattr(model, "W"):
         est_W = model.W.detach()
-        overlap = torch.linalg.matrix_norm(W_true.transpose(-2, -1) @ est_W, ord=2).item()
+        if est_W.shape[-1] > 0:
+            est_subspace, _ = torch.linalg.qr(est_W, mode="reduced")
+            est_subspace = est_subspace[:, : est_W.shape[-1]]
+        overlap = torch.linalg.matrix_norm(W_true.transpose(-2, -1) @ est_subspace, ord=2).item()
         print(f"Subspace overlap spectral norm: {overlap:.4f}")
-        print(f"Orthogonality error (W): {orthogonality_error(est_W).item():.3e}")
+        if getattr(model, "is_stiefel", False):
+            print(f"Orthogonality error (W): {orthogonality_error(est_W).item():.3e}")
+        else:
+            print("Using unconstrained linear embedding (non-Stiefel optimization).")
     if hasattr(model, "eps"):
         print(f"Composite eps: {model.eps.item():.4f}")
 
     visualize_results(
         args.output_dir,
         args.model,
+        model,
         train_x,
         train_y,
         test_x,
         test_y,
         pred_mean,
         losses,
+        W_true,
+        est_subspace,
     )
     print(f"Saved artifacts to: {args.output_dir.resolve()}")
 
