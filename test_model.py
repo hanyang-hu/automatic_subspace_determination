@@ -11,13 +11,19 @@ import numpy as np
 import torch
 
 from manifold_optim import RiemannianAdam
-from models import CompositeGPModel, ProjectedGPModel, StandardGPModel
+from models import (
+    CompositeGPModel,
+    LinearEmbeddingGPModel,
+    ProjectedGPModel,
+    StandardGPModel,
+)
 from utils import make_linear_subspace_train_test_split, orthogonality_error, set_seed
 
 
 MODEL_REGISTRY = {
     "standard": StandardGPModel,
     "projected": ProjectedGPModel,
+    "linear_embedding": LinearEmbeddingGPModel,
     "composite": CompositeGPModel,
 }
 
@@ -37,13 +43,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--latent", default="smooth", choices=["linear", "smooth", "nonlinear"])
     parser.add_argument("--output_dir", type=Path, default=Path("artifacts"))
-    parser.add_argument("--eps_alpha", type=float, default=0.1, help="Half-Cauchy prior scale for composite eps")
+    parser.add_argument("--eps_alpha", type=float, default=0.01, help="Half-Cauchy prior scale for composite eps")
     return parser.parse_args()
 
 
 def split_parameter_groups(model: torch.nn.Module) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
     manifold_params: list[torch.nn.Parameter] = []
-    if hasattr(model, "W"):
+    if hasattr(model, "W") and getattr(model, "uses_riemannian_projection", False):
         manifold_params.append(model.W)
 
     manifold_ids = {id(p) for p in manifold_params}
@@ -135,53 +141,45 @@ def visualize_results(
     fig.savefig(output_dir / f"pred_vs_truth_{model_name}.png", dpi=150)
     plt.close(fig)
 
-    # Visualize objective value + response in true/estimated subspaces.
-    fig = plt.figure(figsize=(12, 8))
-    gs = fig.add_gridspec(2, 2)
-    ax_loss = fig.add_subplot(gs[0, :])
-    ax_loss.plot(losses)
-    ax_loss.set_xlabel("Iteration")
-    ax_loss.set_ylabel("-MLL loss")
-    ax_loss.set_title(f"Objective function trajectory ({model_name})")
+    # Visualize subspace coordinates directly (true vs estimated linear subspace).
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-    def _to_3d_coords(arr: torch.Tensor) -> np.ndarray:
+    def _to_2d_coords(arr: torch.Tensor) -> np.ndarray:
         cols = min(2, arr.shape[-1])
-        out = torch.zeros(arr.shape[0], 3, device=arr.device, dtype=arr.dtype)
+        out = torch.zeros(arr.shape[0], 2, device=arr.device, dtype=arr.dtype)
         out[:, :cols] = arr[:, :cols]
         return out.cpu().numpy()
 
+    y_np = test_y_denorm.detach().cpu().numpy()
     z_true = test_x @ W_true
-    pts_true = _to_3d_coords(z_true)
-    pts_true[:, 2] = test_y_denorm.detach().cpu().numpy()
-    ax_true = fig.add_subplot(gs[1, 0], projection="3d")
-    sc_true = ax_true.scatter(pts_true[:, 0], pts_true[:, 1], pts_true[:, 2], c=pts_true[:, 2], s=12, cmap="viridis")
+    pts_true = _to_2d_coords(z_true)
+    ax_true = axes[0]
+    sc_true = ax_true.scatter(pts_true[:, 0], pts_true[:, 1], c=y_np, s=14, cmap="viridis")
     ax_true.set_xlabel("true z1")
     ax_true.set_ylabel("true z2")
-    ax_true.set_zlabel("y")
-    ax_true.set_title("Ground-truth response on true subspace")
+    ax_true.set_title("Ground-truth subspace (color = true y)")
     fig.colorbar(sc_true, ax=ax_true, shrink=0.7, pad=0.1)
 
     if hasattr(model, "W"):
         z_est = test_x @ model.W.detach()
     else:
         z_est = test_x[:, : W_true.shape[-1]]
-    pts_est = _to_3d_coords(z_est)
-    pts_est[:, 2] = pred_mean_denorm.detach().cpu().numpy()
-    ax_est = fig.add_subplot(gs[1, 1], projection="3d")
-    sc_est = ax_est.scatter(pts_est[:, 0], pts_est[:, 1], pts_est[:, 2], c=pts_est[:, 2], s=12, cmap="plasma")
+    pts_est = _to_2d_coords(z_est)
+    ax_est = axes[1]
+    sc_est = ax_est.scatter(pts_est[:, 0], pts_est[:, 1], c=y_np, s=14, cmap="plasma")
     ax_est.set_xlabel("estimated z1")
     ax_est.set_ylabel("estimated z2")
-    ax_est.set_zlabel("pred y")
-    ax_est.set_title("Predicted response on estimated subspace")
+    ax_est.set_title("Estimated linear subspace (color = true y)")
     fig.colorbar(sc_est, ax=ax_est, shrink=0.7, pad=0.1)
 
     fig.tight_layout()
-    fig.savefig(output_dir / f"objective_and_subspace_response_{model_name}.png", dpi=150)
+    fig.savefig(output_dir / f"subspace_visualization_{model_name}.png", dpi=150)
     plt.close(fig)
 
     if hasattr(model, "W"):
         fig, ax = plt.subplots(figsize=(5, 4))
-        overlap = (W_true.transpose(-2, -1) @ model.W.detach()).abs().cpu().numpy()
+        est_basis, _ = torch.linalg.qr(model.W.detach())
+        overlap = (W_true.transpose(-2, -1) @ est_basis).abs().cpu().numpy()
         im = ax.imshow(overlap, cmap="magma", vmin=0.0, vmax=1.0)
         ax.set_xlabel("Estimated basis index")
         ax.set_ylabel("True basis index")
@@ -240,9 +238,11 @@ def main() -> None:
 
     if hasattr(model, "W"):
         est_W = model.W.detach()
-        overlap = torch.linalg.matrix_norm(W_true.transpose(-2, -1) @ est_W, ord=2).item()
+        est_basis, _ = torch.linalg.qr(est_W)
+        overlap = torch.linalg.matrix_norm(W_true.transpose(-2, -1) @ est_basis, ord=2).item()
         print(f"Subspace overlap spectral norm: {overlap:.4f}")
-        print(f"Orthogonality error (W): {orthogonality_error(est_W).item():.3e}")
+        if getattr(model, "uses_riemannian_projection", False):
+            print(f"Orthogonality error (W): {orthogonality_error(est_W).item():.3e}")
     if hasattr(model, "eps"):
         print(f"Composite eps: {model.eps.item():.4f}")
 

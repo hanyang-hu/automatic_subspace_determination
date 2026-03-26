@@ -4,6 +4,7 @@ This repository provides Gaussian Process (GP) models for subspace-aware regress
 
 - **Standard GP** (`StandardGPModel`): full-space RBF kernel.
 - **Projected GP** (`ProjectedGPModel`): kernel on learned projected coordinates `xW`.
+- **Linear Embedding GP** (`LinearEmbeddingGPModel`): kernel on learned `xW` with unconstrained Euclidean optimization of `W`.
 - **Composite GP** (`CompositeGPModel`): projected kernel plus an `eps`-weighted full-space residual kernel.
 
 It also includes a **Riemannian Adam** optimizer for Stiefel-constrained projection matrices using tangent projection + QR retraction.
@@ -36,6 +37,7 @@ Switch models:
 ```bash
 python test_model.py --model standard
 python test_model.py --model projected
+python test_model.py --model linear_embedding
 python test_model.py --model composite
 ```
 
@@ -58,7 +60,7 @@ The script saves plots under `artifacts/`:
 
 - `loss_curve_<model>.png`
 - `pred_vs_truth_<model>.png`
-- `objective_and_subspace_response_<model>.png`
+- `subspace_visualization_<model>.png`
 - `subspace_overlap_<model>.png` (for models that learn `W`)
 
 and prints summary metrics:
@@ -70,6 +72,6 @@ and prints summary metrics:
 
 ## Notes
 
-- `W` is initialized on the Stiefel manifold using QR.
+- `W` is initialized on the Stiefel manifold using QR for `projected/composite`, and with unconstrained Gaussian weights for `linear_embedding`.
 - `RiemannianAdam` projects Adam directions onto the tangent space and retracts with QR.
-- A Half-Cauchy prior is attached only to the composite gating parameter `eps` (default scale `alpha=0.1`).
+- A Half-Cauchy prior is attached only to the composite gating parameter `eps` (default scale `alpha=0.01`).

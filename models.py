@@ -11,7 +11,7 @@ from gpytorch.constraints import Positive
 from gpytorch.priors import HalfCauchyPrior
 
 
-DEFAULT_EPS_ALPHA = 0.1
+DEFAULT_EPS_ALPHA = 0.01
 
 
 def _initialize_kernel_lengthscale(kernel: gpytorch.kernels.Kernel, dim: int) -> None:
@@ -72,6 +72,16 @@ class ProjectedKernel(gpytorch.kernels.Kernel):
         x1_proj = self.project(x1)
         x2_proj = self.project(x2)
         return self.base_kernel(x1_proj, x2_proj, diag=diag, **params)
+
+
+class LinearEmbeddingKernel(ProjectedKernel):
+    """Projected kernel with an unconstrained linear embedding matrix."""
+
+    @staticmethod
+    def _stiefel_init(input_dim: int, subspace_dim: int) -> torch.Tensor:
+        # Reuse parent construction path but initialize unconstrained weights.
+        scale = 1.0 / math.sqrt(max(input_dim, 1))
+        return torch.randn(input_dim, subspace_dim) * scale
 
 
 class CompositeKernel(gpytorch.kernels.Kernel):
@@ -208,6 +218,7 @@ class ProjectedGPModel(_BaseExactGP):
         subspace_dim: int,
     ) -> None:
         super().__init__(train_x, train_y, likelihood)
+        self.uses_riemannian_projection = True
 
         self.covar_module = gpytorch.kernels.ScaleKernel(
             ProjectedKernel(input_dim=input_dim, subspace_dim=subspace_dim),
@@ -232,6 +243,7 @@ class CompositeGPModel(_BaseExactGP):
         eps_alpha: float = DEFAULT_EPS_ALPHA,
     ) -> None:
         super().__init__(train_x, train_y, likelihood)
+        self.uses_riemannian_projection = True
 
         self.covar_module = gpytorch.kernels.ScaleKernel(
             CompositeKernel(
@@ -258,3 +270,27 @@ class CompositeGPModel(_BaseExactGP):
     @property
     def eps(self) -> torch.Tensor:
         return self.covar_module.base_kernel.eps
+
+
+class LinearEmbeddingGPModel(_BaseExactGP):
+    """Exact GP using an unconstrained learned linear embedding ``xW``."""
+
+    def __init__(
+        self,
+        train_x: torch.Tensor,
+        train_y: torch.Tensor,
+        likelihood: gpytorch.likelihoods.GaussianLikelihood,
+        input_dim: int,
+        subspace_dim: int,
+    ) -> None:
+        super().__init__(train_x, train_y, likelihood)
+        self.uses_riemannian_projection = False
+
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            LinearEmbeddingKernel(input_dim=input_dim, subspace_dim=subspace_dim),
+            outputscale_constraint=Positive(),
+        )
+
+    @property
+    def W(self) -> torch.nn.Parameter:
+        return self.covar_module.base_kernel.W
