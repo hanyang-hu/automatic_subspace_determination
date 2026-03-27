@@ -75,3 +75,33 @@ and prints summary metrics:
 - `W` is initialized on the Stiefel manifold using QR for `projected/composite`, and with unconstrained Gaussian weights for `linear_embedding`.
 - `RiemannianAdam` projects Adam directions onto the tangent space and retracts with QR.
 - A Half-Cauchy prior is attached only to the composite gating parameter `eps` (default scale `alpha=0.01`).
+
+
+## High-dimensional Bayesian optimization benchmark suite
+
+Use `run_bo_benchmarks.py` to compare the four GP models (`standard`, `projected`, `linear_embedding`, `composite`) on:
+
+- 3 synthetic BoTorch functions with non-axis-aligned low-dimensional embeddings (`Ackley`, `Rastrigin`, `Levy`)
+- 2 real-world benchmarks with embedded hyperparameter structure (`LASSO` CV and `RBF-SVM` CV)
+
+The script runs repeated BO with seeds `41-45` by default, saves all traces to CSV, and plots mean best-observed performance over iterations.
+
+```bash
+python run_bo_benchmarks.py
+```
+
+Useful options:
+
+- `--results_dir results/bo`
+- `--ambient_dim 20`
+- `--n_init 12`
+- `--n_iter 25`
+- `--train_steps 80`
+- `--num_candidates 1024`
+- `--seeds 41 42 43 44 45`
+
+Outputs:
+
+- `results/bo/bo_results_all_runs.csv`
+- `results/bo/bo_results_aggregated.csv`
+- `results/bo/bo_results_plot.png`
