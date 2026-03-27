@@ -60,6 +60,9 @@ class ProjectedKernel(gpytorch.kernels.Kernel):
             raise ValueError(
                 f"Expected input dimension {self.input_dim}, got {x.size(-1)}"
             )
+        
+        # x = x.to(self.W.dtype)  # Ensure input is same dtype as W for matmul
+
         return x @ self.W
 
     def forward(

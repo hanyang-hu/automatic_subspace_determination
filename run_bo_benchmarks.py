@@ -65,12 +65,12 @@ class EmbeddedSyntheticObjective:
         self.ambient_dim = ambient_dim
         self.latent_dim = latent_dim
         gen = torch.Generator(device="cpu").manual_seed(seed)
-        q, _ = torch.linalg.qr(torch.randn(ambient_dim, latent_dim, generator=gen, dtype=torch.double), mode="reduced")
+        q, _ = torch.linalg.qr(torch.randn(ambient_dim, latent_dim, generator=gen, dtype=torch.float), mode="reduced")
         self.proj = q[:, :latent_dim]
 
         # BoTorch test function bounds shape: 2 x d
-        self.lower = func.bounds[0].to(dtype=torch.double)
-        self.upper = func.bounds[1].to(dtype=torch.double)
+        self.lower = func.bounds[0].to(dtype=torch.float)
+        self.upper = func.bounds[1].to(dtype=torch.float)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         # x in [0, 1]^D -> latent coords in function domain.
@@ -95,7 +95,7 @@ class EmbeddedRealObjective:
         self.task = task
 
         gen = torch.Generator(device="cpu").manual_seed(seed)
-        q, _ = torch.linalg.qr(torch.randn(ambient_dim, latent_dim, generator=gen, dtype=torch.double), mode="reduced")
+        q, _ = torch.linalg.qr(torch.randn(ambient_dim, latent_dim, generator=gen, dtype=torch.float), mode="reduced")
         self.proj = q[:, :latent_dim]
 
         if task == "lasso":
@@ -146,7 +146,7 @@ class EmbeddedRealObjective:
                 ).mean()
             vals.append(float(score))
 
-        return torch.tensor(vals, dtype=torch.double)
+        return torch.tensor(vals, dtype=torch.float)
 
 
 def build_benchmarks(ambient_dim: int) -> list[BenchmarkSpec]:
@@ -251,7 +251,7 @@ def pick_next_point(
     beta: float,
 ) -> torch.Tensor:
     sobol = torch.quasirandom.SobolEngine(dimension=dim, scramble=True)
-    cand = sobol.draw(num_candidates).to(dtype=torch.double)
+    cand = sobol.draw(num_candidates).to(dtype=torch.float)
 
     pred = likelihood(model(cand))
     mean = pred.mean
@@ -274,8 +274,8 @@ def run_single_bo(
     set_seed(seed)
 
     sobol = torch.quasirandom.SobolEngine(dimension=benchmark.ambient_dim, scramble=True, seed=seed)
-    train_x = sobol.draw(n_init).to(dtype=torch.double)
-    train_y = benchmark.objective(train_x).to(dtype=torch.double)
+    train_x = sobol.draw(n_init).to(dtype=torch.float)
+    train_y = benchmark.objective(train_x).to(dtype=torch.float)
 
     best_trace = [float(torch.max(train_y).item())]
     for _ in range(n_iter):
@@ -300,7 +300,7 @@ def run_single_bo(
             num_candidates=num_candidates,
             beta=beta,
         )
-        y_next = benchmark.objective(x_next).to(dtype=torch.double)
+        y_next = benchmark.objective(x_next).to(dtype=torch.float)
 
         train_x = torch.cat([train_x, x_next], dim=0)
         train_y = torch.cat([train_y, y_next], dim=0)
