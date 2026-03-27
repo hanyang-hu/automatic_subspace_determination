@@ -84,7 +84,7 @@ Use `run_bo_benchmarks.py` to compare the four GP models (`standard`, `projected
 - 3 synthetic BoTorch functions with non-axis-aligned low-dimensional embeddings (`Ackley`, `Rastrigin`, `Levy`)
 - 2 real-world benchmarks with embedded hyperparameter structure (`LASSO` CV and `RBF-SVM` CV)
 
-The script runs repeated BO with seeds `41-45` by default, saves all traces to CSV, and plots mean best-observed performance over iterations.
+The script runs repeated BO with seeds `41-45` by default, saves per-seed traces to CSV, and plots mean best-observed performance over iterations.
 
 ```bash
 python run_bo_benchmarks.py
@@ -92,7 +92,7 @@ python run_bo_benchmarks.py
 
 Useful options:
 
-- `--results_dir results/bo`
+- `--output_dir outputs`
 - `--ambient_dim 20`
 - `--n_init 12`
 - `--n_iter 25`
@@ -100,8 +100,9 @@ Useful options:
 - `--num_candidates 1024`
 - `--seeds 41 42 43 44 45`
 
-Outputs:
+Outputs (for each benchmark/model pair):
 
-- `results/bo/bo_results_all_runs.csv`
-- `results/bo/bo_results_aggregated.csv`
-- `results/bo/bo_results_plot.png`
+- `outputs/<benchmark>/<model>/bo_run_seed_<seed>.csv`
+- `outputs/<benchmark>/<model>/bo_results_all_runs.csv`
+- `outputs/<benchmark>/<model>/bo_results_aggregated.csv`
+- `outputs/<benchmark>/<model>/bo_results_plot.png`

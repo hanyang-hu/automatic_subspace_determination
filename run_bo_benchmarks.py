@@ -309,6 +309,18 @@ def run_single_bo(
     return best_trace
 
 
+def save_run_trace(run_rows: list[dict], out_dir: Path, seed: int) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    run_csv = out_dir / f"bo_run_seed_{seed}.csv"
+    with run_csv.open("w", encoding="utf-8") as f:
+        f.write("benchmark,model,seed,iteration,best_observed\n")
+        for row in run_rows:
+            f.write(
+                f"{row['benchmark']},{row['model']},{row['seed']},{row['iteration']},{row['best_observed']:.10f}\n"
+            )
+    return run_csv
+
+
 def aggregate_and_save(all_rows: list[dict], out_dir: Path) -> list[dict]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -349,42 +361,38 @@ def aggregate_and_save(all_rows: list[dict], out_dir: Path) -> list[dict]:
     return agg_rows
 
 
-def plot_aggregated(agg_rows: list[dict], out_dir: Path) -> None:
+def plot_aggregated(agg_rows: list[dict], out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    benchmarks = sorted({r["benchmark"] for r in agg_rows})
-    n = len(benchmarks)
-    fig, axes = plt.subplots(nrows=n, ncols=1, figsize=(9, 3.5 * n), sharex=False)
-    if n == 1:
-        axes = [axes]
+    if not agg_rows:
+        raise ValueError("No rows to plot.")
 
-    for ax, bench in zip(axes, benchmarks):
-        bench_rows = [r for r in agg_rows if r["benchmark"] == bench]
-        model_names = sorted({r["model"] for r in bench_rows})
-        for model_name in model_names:
-            rows = sorted(
-                (r for r in bench_rows if r["model"] == model_name),
-                key=lambda r: r["iteration"],
-            )
-            x = np.array([r["iteration"] for r in rows], dtype=float)
-            m = np.array([r["best_observed_mean"] for r in rows], dtype=float)
-            s = np.array([r["best_observed_std"] for r in rows], dtype=float)
-            ax.plot(x, m, label=model_name)
-            ax.fill_between(x, m - s, m + s, alpha=0.15)
+    benchmark_name = agg_rows[0]["benchmark"]
+    model_name = agg_rows[0]["model"]
+    rows = sorted(agg_rows, key=lambda r: r["iteration"])
+    x = np.array([r["iteration"] for r in rows], dtype=float)
+    m = np.array([r["best_observed_mean"] for r in rows], dtype=float)
+    s = np.array([r["best_observed_std"] for r in rows], dtype=float)
 
-        ax.set_title(bench)
-        ax.set_xlabel("BO iteration")
-        ax.set_ylabel("Best observed value")
-        ax.grid(alpha=0.2)
-        ax.legend(loc="best")
+    fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(9, 4.5))
+    ax.plot(x, m, label=model_name)
+    ax.fill_between(x, m - s, m + s, alpha=0.15)
+
+    ax.set_title(f"{benchmark_name} | {model_name}")
+    ax.set_xlabel("BO iteration")
+    ax.set_ylabel("Best observed value")
+    ax.grid(alpha=0.2)
+    ax.legend(loc="best")
 
     fig.tight_layout()
-    fig.savefig(out_dir / "bo_results_plot.png", dpi=180)
+    plot_path = out_dir / "bo_results_plot.png"
+    fig.savefig(plot_path, dpi=180)
     plt.close(fig)
+    return plot_path
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--results_dir", type=Path, default=Path("results/bo"))
+    parser.add_argument("--output_dir", type=Path, default=Path("outputs"))
     parser.add_argument("--ambient_dim", type=int, default=20)
     parser.add_argument("--n_init", type=int, default=12)
     parser.add_argument("--n_iter", type=int, default=25)
@@ -400,9 +408,10 @@ def main() -> None:
     args = parse_args()
     benchmarks = build_benchmarks(ambient_dim=args.ambient_dim)
 
-    all_rows: list[dict] = []
     for bench in benchmarks:
         for model_name in args.models:
+            method_dir = args.output_dir / bench.name / model_name
+            combo_rows: list[dict] = []
             for seed in args.seeds:
                 print(f"[RUN] benchmark={bench.name} model={model_name} seed={seed}")
                 trace = run_single_bo(
@@ -415,22 +424,25 @@ def main() -> None:
                     lr=args.lr,
                     num_candidates=args.num_candidates,
                 )
+                run_rows: list[dict] = []
                 for it, best in enumerate(trace):
-                    all_rows.append(
-                        {
-                            "benchmark": bench.name,
-                            "model": model_name,
-                            "seed": seed,
-                            "iteration": it,
-                            "best_observed": best,
-                        }
-                    )
+                    row = {
+                        "benchmark": bench.name,
+                        "model": model_name,
+                        "seed": seed,
+                        "iteration": it,
+                        "best_observed": best,
+                    }
+                    run_rows.append(row)
+                    combo_rows.append(row)
 
-    agg = aggregate_and_save(all_rows, args.results_dir)
-    plot_aggregated(agg, args.results_dir)
-    print(f"Saved run-level results to: {args.results_dir / 'bo_results_all_runs.csv'}")
-    print(f"Saved aggregate results to: {args.results_dir / 'bo_results_aggregated.csv'}")
-    print(f"Saved plot to: {args.results_dir / 'bo_results_plot.png'}")
+                run_csv_path = save_run_trace(run_rows, method_dir, seed=seed)
+                print(f"Saved run trace to: {run_csv_path}")
+
+            agg_csv_rows = aggregate_and_save(combo_rows, method_dir)
+            plot_path = plot_aggregated(agg_csv_rows, method_dir)
+            print(f"Saved aggregate results to: {method_dir / 'bo_results_aggregated.csv'}")
+            print(f"Saved plot to: {plot_path}")
 
 
 if __name__ == "__main__":
