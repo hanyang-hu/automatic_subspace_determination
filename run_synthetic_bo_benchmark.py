@@ -1,4 +1,4 @@
-"""Run high-dimensional Bayesian optimization benchmarks across four GP models.
+"""Run synthetic high-dimensional Bayesian optimization benchmarks.
 
 This script evaluates four surrogate model variants:
   - standard
@@ -8,10 +8,10 @@ This script evaluates four surrogate model variants:
 
 Benchmarks:
   - Synthetic (BoTorch): Ackley, Rastrigin, Levy
-  - Real-world (sklearn): LASSO CV, RBF-SVM CV
 
-For each benchmark and model, the script runs repeated BO with seeds 41-45 by default,
-saves per-run traces to CSV, saves aggregate means/std to CSV, and writes summary plots.
+For each synthetic benchmark and model, the script runs repeated BO with seeds 41-45 by
+default, saves per-run traces to CSV (including raw observations), saves aggregate
+means/std to CSV, and writes summary plots.
 """
 
 from __future__ import annotations
@@ -28,12 +28,6 @@ import torch
 from botorch.acquisition.analytic import LogExpectedImprovement
 from botorch.optim import optimize_acqf
 from botorch.test_functions import Ackley, Levy, Rastrigin
-from sklearn.datasets import load_breast_cancer, load_diabetes
-from sklearn.linear_model import Lasso
-from sklearn.model_selection import KFold, cross_val_score
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVC
 
 from manifold_optim import RiemannianAdam
 from models import CompositeGPModel, LinearEmbeddingGPModel, ProjectedGPModel, StandardGPModel
@@ -83,76 +77,8 @@ class EmbeddedSyntheticObjective:
         return -val
 
 
-class EmbeddedRealObjective:
-    def __init__(
-        self,
-        ambient_dim: int,
-        latent_dim: int,
-        seed: int,
-        task: str,
-    ) -> None:
-        self.ambient_dim = ambient_dim
-        self.latent_dim = latent_dim
-        self.task = task
-
-        gen = torch.Generator(device="cpu").manual_seed(seed)
-        q, _ = torch.linalg.qr(torch.randn(ambient_dim, latent_dim, generator=gen, dtype=torch.float), mode="reduced")
-        self.proj = q[:, :latent_dim]
-
-        if task == "lasso":
-            X, y = load_diabetes(return_X_y=True)
-            self.X = X
-            self.y = y
-            self.cv = KFold(n_splits=3, shuffle=True, random_state=seed)
-        elif task == "svm":
-            data = load_breast_cancer()
-            self.X = data.data
-            self.y = data.target
-            self.cv = KFold(n_splits=3, shuffle=True, random_state=seed)
-        else:
-            raise ValueError(f"Unsupported real objective task: {task}")
-
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        # x in [0,1]^D -> u in R^latent_dim
-        u = (x - 0.5) @ self.proj
-        u = torch.sigmoid(2.5 * u)
-
-        vals: list[float] = []
-        for row in u:
-            a = float(row[0].detach().cpu())
-            b = float(row[1].detach().cpu()) if self.latent_dim > 1 else 0.5
-
-            if self.task == "lasso":
-                alpha = 10 ** (-4 + 4 * a)  # [1e-4, 1]
-                model = make_pipeline(StandardScaler(), Lasso(alpha=alpha, max_iter=5000, random_state=0))
-                score = cross_val_score(
-                    model,
-                    self.X,
-                    self.y,
-                    cv=self.cv,
-                    scoring="neg_mean_squared_error",
-                    n_jobs=1,
-                ).mean()
-            else:  # svm
-                C = 10 ** (-2 + 4 * a)  # [1e-2, 1e2]
-                gamma = 10 ** (-4 + 4 * b)  # [1e-4, 1]
-                model = make_pipeline(StandardScaler(), SVC(C=C, gamma=gamma, kernel="rbf", random_state=0))
-                score = cross_val_score(
-                    model,
-                    self.X,
-                    self.y,
-                    cv=self.cv,
-                    scoring="accuracy",
-                    n_jobs=1,
-                ).mean()
-            vals.append(float(score))
-
-        return torch.tensor(vals, dtype=torch.float)
-
-
-def build_benchmarks(synth_ambient_dim: int, real_ambient_dim: int) -> list[BenchmarkSpec]:
+def build_benchmarks(synth_ambient_dim: int) -> list[BenchmarkSpec]:
     synth_latent_dim = 6
-    real_latent_dim = 2
     benches: list[BenchmarkSpec] = [
         BenchmarkSpec(
             name="synthetic_ackley",
@@ -172,20 +98,17 @@ def build_benchmarks(synth_ambient_dim: int, real_ambient_dim: int) -> list[Benc
             subspace_dim=synth_latent_dim,
             objective=EmbeddedSyntheticObjective(Levy(dim=synth_latent_dim), synth_ambient_dim, synth_latent_dim, seed=303),
         ),
-        BenchmarkSpec(
-            name="real_lasso_cv",
-            ambient_dim=real_ambient_dim,
-            subspace_dim=real_latent_dim,
-            objective=EmbeddedRealObjective(real_ambient_dim, real_latent_dim, seed=404, task="lasso"),
-        ),
-        BenchmarkSpec(
-            name="real_svm_cv",
-            ambient_dim=real_ambient_dim,
-            subspace_dim=real_latent_dim,
-            objective=EmbeddedRealObjective(real_ambient_dim, real_latent_dim, seed=505, task="svm"),
-        ),
     ]
     return benches
+
+
+@dataclass
+class BOConfig:
+    train_steps: int
+    lr: float
+    acq_num_restarts: int
+    acq_raw_samples: int
+    stagnation_patience: int
 
 
 def split_parameter_groups(model: torch.nn.Module) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
@@ -270,56 +193,72 @@ def run_single_bo(
     seed: int,
     n_init: int,
     n_iter: int,
-    train_steps: int,
-    lr: float,
-    acq_num_restarts: int,
-    acq_raw_samples: int,
-) -> list[float]:
+    config: BOConfig,
+    print_every: int,
+) -> list[dict]:
     set_seed(seed)
 
     sobol = torch.quasirandom.SobolEngine(dimension=benchmark.ambient_dim, scramble=True, seed=seed)
     train_x = sobol.draw(n_init).to(dtype=torch.float)
     train_y = benchmark.objective(train_x).to(dtype=torch.float)
 
-    best_trace = [float(torch.max(train_y).item())]
-    for _ in range(n_iter):
+    incumbent = float(torch.max(train_y).item())
+    rows: list[dict] = [{"iteration": 0, "observed_value": incumbent, "best_observed": incumbent}]
+    no_improvement_steps = 0
+    for bo_iter in range(1, n_iter + 1):
         y_mean = train_y.mean()
         y_std = train_y.std(unbiased=False).clamp_min(1e-6)
         train_y_norm = (train_y - y_mean) / y_std
 
-        model, likelihood = fit_surrogate(
+        model, _ = fit_surrogate(
             model_name=model_name,
             train_x=train_x,
             train_y=train_y_norm,
             subspace_dim=benchmark.subspace_dim,
-            train_steps=train_steps,
-            lr=lr,
+            train_steps=config.train_steps,
+            lr=config.lr,
         )
 
-        x_next = pick_next_point(
-            model=model,
-            dim=benchmark.ambient_dim,
-            best_f=float(train_y_norm.max().item()),
-            num_restarts=acq_num_restarts,
-            raw_samples=acq_raw_samples,
-        )
+        if config.stagnation_patience > 0 and no_improvement_steps >= config.stagnation_patience:
+            x_next = torch.rand(1, benchmark.ambient_dim, dtype=torch.float)
+            no_improvement_steps = 0
+        else:
+            x_next = pick_next_point(
+                model=model,
+                dim=benchmark.ambient_dim,
+                best_f=float(train_y_norm.max().item()),
+                num_restarts=config.acq_num_restarts,
+                raw_samples=config.acq_raw_samples,
+            )
         y_next = benchmark.objective(x_next).to(dtype=torch.float)
+        observed_value = float(y_next.item())
 
         train_x = torch.cat([train_x, x_next], dim=0)
         train_y = torch.cat([train_y, y_next], dim=0)
-        best_trace.append(float(torch.max(train_y).item()))
+        prev_incumbent = incumbent
+        incumbent = max(incumbent, observed_value)
+        improved = observed_value > prev_incumbent + 1e-12
+        no_improvement_steps = 0 if improved else no_improvement_steps + 1
 
-    return best_trace
+        rows.append({"iteration": bo_iter, "observed_value": observed_value, "best_observed": incumbent})
+        if print_every > 0 and bo_iter % print_every == 0:
+            print(
+                f"[ITER {bo_iter:04d}] observed={observed_value:.6f} "
+                f"incumbent={incumbent:.6f} stalled_for={no_improvement_steps}"
+            )
+
+    return rows
 
 
 def save_run_trace(run_rows: list[dict], out_dir: Path, seed: int) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     run_csv = out_dir / f"bo_run_seed_{seed}.csv"
     with run_csv.open("w", encoding="utf-8") as f:
-        f.write("benchmark,model,seed,iteration,best_observed\n")
+        f.write("benchmark,model,seed,iteration,observed_value,best_observed\n")
         for row in run_rows:
             f.write(
-                f"{row['benchmark']},{row['model']},{row['seed']},{row['iteration']},{row['best_observed']:.10f}\n"
+                f"{row['benchmark']},{row['model']},{row['seed']},{row['iteration']},"
+                f"{row['observed_value']:.10f},{row['best_observed']:.10f}\n"
             )
     return run_csv
 
@@ -348,10 +287,11 @@ def aggregate_and_save(all_rows: list[dict], out_dir: Path) -> list[dict]:
 
     all_csv = out_dir / "bo_results_all_runs.csv"
     with all_csv.open("w", encoding="utf-8") as f:
-        f.write("benchmark,model,seed,iteration,best_observed\n")
+        f.write("benchmark,model,seed,iteration,observed_value,best_observed\n")
         for row in all_rows:
             f.write(
-                f"{row['benchmark']},{row['model']},{row['seed']},{row['iteration']},{row['best_observed']:.10f}\n"
+                f"{row['benchmark']},{row['model']},{row['seed']},{row['iteration']},"
+                f"{row['observed_value']:.10f},{row['best_observed']:.10f}\n"
             )
 
     grouped: dict[tuple[str, str, int], list[float]] = {}
@@ -416,51 +356,78 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output_dir", type=Path, default=Path("outputs"))
     parser.add_argument("--synthetic_ambient_dim", type=int, default=50)
-    parser.add_argument("--real_ambient_dim", type=int, default=20)
     parser.add_argument("--n_init", type=int, default=50)
-    parser.add_argument("--n_iter_synthetic", type=int, default=100)
-    parser.add_argument("--n_iter_real", type=int, default=500)
+    parser.add_argument("--n_iter", type=int, default=100)
     parser.add_argument("--train_steps", type=int, default=50)
     parser.add_argument("--lr", type=float, default=0.05)
     parser.add_argument("--acq_num_restarts", type=int, default=5)
     parser.add_argument("--acq_raw_samples", type=int, default=256)
+    parser.add_argument("--stagnation_patience", type=int, default=20)
+    parser.add_argument("--standard_train_steps_mult", type=float, default=2.0)
+    parser.add_argument("--standard_lr_mult", type=float, default=0.5)
+    parser.add_argument("--standard_acq_mult", type=float, default=2.0)
+    parser.add_argument("--print_every", type=int, default=10)
     parser.add_argument("--seeds", type=int, nargs="+", default=[41, 42, 43, 44, 45])
     parser.add_argument("--models", nargs="+", default=list(MODEL_REGISTRY.keys()), choices=list(MODEL_REGISTRY.keys()))
     return parser.parse_args()
 
 
+def build_config(args: argparse.Namespace, model_name: str) -> BOConfig:
+    train_steps = args.train_steps
+    lr = args.lr
+    acq_num_restarts = args.acq_num_restarts
+    acq_raw_samples = args.acq_raw_samples
+
+    if model_name == "standard":
+        train_steps = max(1, int(round(train_steps * args.standard_train_steps_mult)))
+        lr = max(1e-4, lr * args.standard_lr_mult)
+        acq_num_restarts = max(1, int(round(acq_num_restarts * args.standard_acq_mult)))
+        acq_raw_samples = max(32, int(round(acq_raw_samples * args.standard_acq_mult)))
+
+    return BOConfig(
+        train_steps=train_steps,
+        lr=lr,
+        acq_num_restarts=acq_num_restarts,
+        acq_raw_samples=acq_raw_samples,
+        stagnation_patience=args.stagnation_patience,
+    )
+
+
 def main() -> None:
     args = parse_args()
-    benchmarks = build_benchmarks(
-        synth_ambient_dim=args.synthetic_ambient_dim,
-        real_ambient_dim=args.real_ambient_dim,
-    )
+    benchmarks = build_benchmarks(synth_ambient_dim=args.synthetic_ambient_dim)
 
     for bench in benchmarks:
         for model_name in args.models:
+            config = build_config(args, model_name)
             method_dir = args.output_dir / bench.name / model_name
             combo_rows: list[dict] = []
             for seed in args.seeds:
                 print(f"[RUN] benchmark={bench.name} model={model_name} seed={seed}")
-                trace = run_single_bo(
+                print(
+                    "[CONFIG] "
+                    f"train_steps={config.train_steps} lr={config.lr:.6f} "
+                    f"acq_num_restarts={config.acq_num_restarts} acq_raw_samples={config.acq_raw_samples} "
+                    f"stagnation_patience={config.stagnation_patience}"
+                )
+                trace_rows = run_single_bo(
                     benchmark=bench,
                     model_name=model_name,
                     seed=seed,
                     n_init=args.n_init,
-                    n_iter=args.n_iter_synthetic if bench.name.startswith("synthetic_") else args.n_iter_real,
-                    train_steps=args.train_steps,
-                    lr=args.lr,
-                    acq_num_restarts=args.acq_num_restarts,
-                    acq_raw_samples=args.acq_raw_samples,
+                    n_iter=args.n_iter,
+                    config=config,
+                    print_every=args.print_every,
                 )
                 run_rows: list[dict] = []
-                for it, best in enumerate(trace):
+                for row_data in trace_rows:
                     row = {
                         "benchmark": bench.name,
                         "model": model_name,
                         "seed": seed,
-                        "iteration": it,
-                        "best_observed": best,
+                        "iteration": row_data["iteration"],
+                        "observed_value": row_data["observed_value"],
+                        "best_observed": row_data["best_observed"],
                     }
                     run_rows.append(row)
                     combo_rows.append(row)
