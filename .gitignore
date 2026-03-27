@@ -4,4 +4,4 @@ __pycache__/
 # Experiment outputs
 artifacts/
 outputs/
-results/
+results/  # legacy BO output path
