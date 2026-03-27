@@ -77,27 +77,28 @@ and prints summary metrics:
 - A Half-Cauchy prior is attached only to the composite gating parameter `eps` (default scale `alpha=0.01`).
 
 
-## High-dimensional Bayesian optimization benchmark suite
+## Synthetic high-dimensional Bayesian optimization benchmark suite
 
-Use `run_bo_benchmarks.py` to compare the four GP models (`standard`, `projected`, `linear_embedding`, `composite`) on:
+Use `run_synthetic_bo_benchmark.py` to compare the four GP models (`standard`, `projected`, `linear_embedding`, `composite`) on:
 
 - 3 synthetic BoTorch functions with non-axis-aligned low-dimensional embeddings (`Ackley`, `Rastrigin`, `Levy`)
-- 2 real-world benchmarks with embedded hyperparameter structure (`LASSO` CV and `RBF-SVM` CV)
 
-The script runs repeated BO with seeds `41-45` by default, saves per-seed traces to CSV, and plots mean best-observed performance over iterations.
+The script runs repeated BO with seeds `41-45` by default, saves per-seed traces to CSV (including raw observed values and incumbent values), prints progress every 10 iterations, and plots mean best-observed performance over iterations.
 
 ```bash
-python run_bo_benchmarks.py
+python run_synthetic_bo_benchmark.py
 ```
 
 Useful options:
 
 - `--output_dir outputs`
-- `--ambient_dim 20`
-- `--n_init 12`
-- `--n_iter 25`
-- `--train_steps 80`
-- `--num_candidates 1024`
+- `--synthetic_ambient_dim 50`
+- `--n_init 50`
+- `--n_iter 100`
+- `--train_steps 50`
+- `--lr 0.05`
+- `--stagnation_patience 20`
+- `--print_every 10`
 - `--seeds 41 42 43 44 45`
 
 Outputs (for each benchmark/model pair):
