@@ -126,6 +126,14 @@ class SurrogateWarmStart:
     eps: torch.Tensor | None = None
 
 
+def _to_cloned_tensor(value: torch.Tensor | float | None) -> torch.Tensor | None:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        return value.detach().clone()
+    return torch.as_tensor(value, dtype=DEFAULT_DTYPE).detach().clone()
+
+
 def split_parameter_groups(model: torch.nn.Module) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
     manifold_params: list[torch.nn.Parameter] = []
     if hasattr(model, "W") and getattr(model, "uses_riemannian_projection", False):
@@ -145,6 +153,7 @@ def fit_surrogate(
     lr: float,
     manifold_lr_mult: float,
     warm_start: SurrogateWarmStart | None = None,
+    warm_start_w_only: bool = True,
 ) -> tuple[torch.nn.Module, gpytorch.likelihoods.GaussianLikelihood]:
     likelihood = gpytorch.likelihoods.GaussianLikelihood()
     model_cls = MODEL_REGISTRY[model_name]
@@ -159,10 +168,11 @@ def fit_surrogate(
         kwargs["eps_alpha"] = 0.1
 
     model = model_cls(**kwargs)
+    likelihood.noise = torch.as_tensor(1e-6, dtype=train_x.dtype, device=train_x.device)
     if warm_start is not None:
         if warm_start.W is not None and hasattr(model, "W"):
             model.W.data.copy_(warm_start.W.to(device=model.W.device, dtype=model.W.dtype))
-        if warm_start.lengthscale is not None:
+        if (not warm_start_w_only) and warm_start.lengthscale is not None:
             target_kernel = model.covar_module.base_kernel
             if hasattr(target_kernel, "base_kernel"):
                 target_kernel = target_kernel.base_kernel
@@ -171,17 +181,17 @@ def fit_surrogate(
                     device=target_kernel.lengthscale.device,
                     dtype=target_kernel.lengthscale.dtype,
                 )
-        if warm_start.outputscale is not None and hasattr(model.covar_module, "outputscale"):
+        if (not warm_start_w_only) and warm_start.outputscale is not None and hasattr(model.covar_module, "outputscale"):
             model.covar_module.outputscale = warm_start.outputscale.to(
                 device=model.covar_module.outputscale.device,
                 dtype=model.covar_module.outputscale.dtype,
             )
-        if warm_start.noise is not None and hasattr(likelihood, "noise"):
+        if (not warm_start_w_only) and warm_start.noise is not None and hasattr(likelihood, "noise"):
             likelihood.noise = warm_start.noise.to(
                 device=likelihood.noise.device,
                 dtype=likelihood.noise.dtype,
             )
-        if warm_start.eps is not None and hasattr(model, "eps"):
+        if (not warm_start_w_only) and warm_start.eps is not None and hasattr(model, "eps"):
             model.covar_module.base_kernel.eps = warm_start.eps.to(
                 device=model.covar_module.base_kernel.eps.device,
                 dtype=model.covar_module.base_kernel.eps.dtype,
@@ -211,7 +221,11 @@ def fit_surrogate(
 
     return model.eval(), likelihood.eval()
 
-def build_warm_start(model: torch.nn.Module, likelihood: gpytorch.likelihoods.GaussianLikelihood) -> SurrogateWarmStart:
+def build_warm_start(
+    model: torch.nn.Module,
+    likelihood: gpytorch.likelihoods.GaussianLikelihood,
+    include_non_w: bool = False,
+) -> SurrogateWarmStart:
     kernel = model.covar_module.base_kernel
     if hasattr(kernel, "base_kernel"):
         projected_kernel = kernel
@@ -221,11 +235,11 @@ def build_warm_start(model: torch.nn.Module, likelihood: gpytorch.likelihoods.Ga
         base_kernel = kernel
 
     warm = SurrogateWarmStart(
-        W=model.W.detach().clone() if hasattr(model, "W") else None,
-        lengthscale=base_kernel.lengthscale.detach().clone() if hasattr(base_kernel, "lengthscale") else None,
-        outputscale=model.covar_module.outputscale.detach().clone() if hasattr(model.covar_module, "outputscale") else None,
-        noise=likelihood.noise.detach().clone() if hasattr(likelihood, "noise") else None,
-        eps=projected_kernel.eps.detach().clone() if projected_kernel is not None and hasattr(projected_kernel, "eps") else None,
+        W=_to_cloned_tensor(model.W if hasattr(model, "W") else None),
+        lengthscale=_to_cloned_tensor(base_kernel.lengthscale) if include_non_w and hasattr(base_kernel, "lengthscale") else None,
+        outputscale=_to_cloned_tensor(model.covar_module.outputscale) if include_non_w and hasattr(model.covar_module, "outputscale") else None,
+        noise=_to_cloned_tensor(likelihood.noise) if include_non_w and hasattr(likelihood, "noise") else None,
+        eps=_to_cloned_tensor(projected_kernel.eps) if include_non_w and projected_kernel is not None and hasattr(projected_kernel, "eps") else None,
     )
     return warm
 
@@ -259,6 +273,7 @@ def run_single_bo(
     n_iter: int,
     config: BOConfig,
     print_every: int,
+    warm_start_w_only: bool,
 ) -> list[dict]:
     set_seed(seed)
 
@@ -284,8 +299,13 @@ def run_single_bo(
             lr=config.lr,
             manifold_lr_mult=config.manifold_lr_mult,
             warm_start=warm_start,
+            warm_start_w_only=warm_start_w_only,
         )
-        warm_start = build_warm_start(model=model, likelihood=likelihood)
+        warm_start = build_warm_start(
+            model=model,
+            likelihood=likelihood,
+            include_non_w=not warm_start_w_only,
+        )
 
         if config.stagnation_patience > 0 and no_improvement_steps >= config.stagnation_patience:
             x_next = torch.rand(1, benchmark.ambient_dim, dtype=DEFAULT_DTYPE)
@@ -423,9 +443,16 @@ def plot_aggregated(agg_rows: list[dict], out_dir: Path) -> Path:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output_dir", type=Path, default=Path("outputs"))
-    parser.add_argument("--synthetic_ambient_dim", type=int, default=50)
+    parser.add_argument("--synthetic_ambient_dim", type=int, default=25)
     parser.add_argument("--n_init", type=int, default=50)
-    parser.add_argument("--n_iter", type=int, default=100)
+    parser.add_argument("--n_iter", type=int, default=200)
+    parser.add_argument(
+        "--warm_start_mode",
+        type=str,
+        default="w_only",
+        choices=["w_only", "all"],
+        help="Warm-start policy across BO iterations.",
+    )
     parser.add_argument("--train_steps", type=int, default=50)
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--manifold_lr_mult", type=float, default=0.2)
@@ -488,6 +515,7 @@ def main() -> None:
                     n_iter=args.n_iter,
                     config=config,
                     print_every=args.print_every,
+                    warm_start_w_only=args.warm_start_mode == "w_only",
                 )
                 run_rows: list[dict] = []
                 for row_data in trace_rows:
