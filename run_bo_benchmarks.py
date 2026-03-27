@@ -17,7 +17,6 @@ saves per-run traces to CSV, saves aggregate means/std to CSV, and writes summar
 from __future__ import annotations
 
 import argparse
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -26,6 +25,8 @@ import gpytorch
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from botorch.acquisition.analytic import LogExpectedImprovement
+from botorch.optim import optimize_acqf
 from botorch.test_functions import Ackley, Levy, Rastrigin
 from sklearn.datasets import load_breast_cancer, load_diabetes
 from sklearn.linear_model import Lasso
@@ -149,39 +150,39 @@ class EmbeddedRealObjective:
         return torch.tensor(vals, dtype=torch.float)
 
 
-def build_benchmarks(ambient_dim: int) -> list[BenchmarkSpec]:
+def build_benchmarks(synth_ambient_dim: int, real_ambient_dim: int) -> list[BenchmarkSpec]:
     synth_latent_dim = 6
     real_latent_dim = 2
     benches: list[BenchmarkSpec] = [
         BenchmarkSpec(
             name="synthetic_ackley",
-            ambient_dim=ambient_dim,
+            ambient_dim=synth_ambient_dim,
             subspace_dim=synth_latent_dim,
-            objective=EmbeddedSyntheticObjective(Ackley(dim=synth_latent_dim), ambient_dim, synth_latent_dim, seed=101),
+            objective=EmbeddedSyntheticObjective(Ackley(dim=synth_latent_dim), synth_ambient_dim, synth_latent_dim, seed=101),
         ),
         BenchmarkSpec(
             name="synthetic_rastrigin",
-            ambient_dim=ambient_dim,
+            ambient_dim=synth_ambient_dim,
             subspace_dim=synth_latent_dim,
-            objective=EmbeddedSyntheticObjective(Rastrigin(dim=synth_latent_dim), ambient_dim, synth_latent_dim, seed=202),
+            objective=EmbeddedSyntheticObjective(Rastrigin(dim=synth_latent_dim), synth_ambient_dim, synth_latent_dim, seed=202),
         ),
         BenchmarkSpec(
             name="synthetic_levy",
-            ambient_dim=ambient_dim,
+            ambient_dim=synth_ambient_dim,
             subspace_dim=synth_latent_dim,
-            objective=EmbeddedSyntheticObjective(Levy(dim=synth_latent_dim), ambient_dim, synth_latent_dim, seed=303),
+            objective=EmbeddedSyntheticObjective(Levy(dim=synth_latent_dim), synth_ambient_dim, synth_latent_dim, seed=303),
         ),
         BenchmarkSpec(
             name="real_lasso_cv",
-            ambient_dim=ambient_dim,
+            ambient_dim=real_ambient_dim,
             subspace_dim=real_latent_dim,
-            objective=EmbeddedRealObjective(ambient_dim, real_latent_dim, seed=404, task="lasso"),
+            objective=EmbeddedRealObjective(real_ambient_dim, real_latent_dim, seed=404, task="lasso"),
         ),
         BenchmarkSpec(
             name="real_svm_cv",
-            ambient_dim=ambient_dim,
+            ambient_dim=real_ambient_dim,
             subspace_dim=real_latent_dim,
-            objective=EmbeddedRealObjective(ambient_dim, real_latent_dim, seed=505, task="svm"),
+            objective=EmbeddedRealObjective(real_ambient_dim, real_latent_dim, seed=505, task="svm"),
         ),
     ]
     return benches
@@ -242,23 +243,25 @@ def fit_surrogate(
     return model.eval(), likelihood.eval()
 
 
-@torch.no_grad()
 def pick_next_point(
     model: torch.nn.Module,
-    likelihood: gpytorch.likelihoods.GaussianLikelihood,
     dim: int,
-    num_candidates: int,
-    beta: float,
+    best_f: float,
+    num_restarts: int,
+    raw_samples: int,
 ) -> torch.Tensor:
-    sobol = torch.quasirandom.SobolEngine(dimension=dim, scramble=True)
-    cand = sobol.draw(num_candidates).to(dtype=torch.float)
-
-    pred = likelihood(model(cand))
-    mean = pred.mean
-    std = pred.variance.clamp_min(1e-12).sqrt()
-    ucb = mean + beta * std
-    idx = int(torch.argmax(ucb).item())
-    return cand[idx : idx + 1]
+    bounds = torch.stack(
+        [torch.zeros(dim, dtype=torch.float), torch.ones(dim, dtype=torch.float)]
+    )
+    acqf = LogExpectedImprovement(model=model, best_f=best_f)
+    candidates, _ = optimize_acqf(
+        acq_function=acqf,
+        bounds=bounds,
+        q=1,
+        num_restarts=num_restarts,
+        raw_samples=raw_samples,
+    )
+    return candidates
 
 
 def run_single_bo(
@@ -269,7 +272,8 @@ def run_single_bo(
     n_iter: int,
     train_steps: int,
     lr: float,
-    num_candidates: int,
+    acq_num_restarts: int,
+    acq_raw_samples: int,
 ) -> list[float]:
     set_seed(seed)
 
@@ -292,13 +296,12 @@ def run_single_bo(
             lr=lr,
         )
 
-        beta = 0.2 * math.log(len(train_x) + 1)
         x_next = pick_next_point(
             model=model,
-            likelihood=likelihood,
             dim=benchmark.ambient_dim,
-            num_candidates=num_candidates,
-            beta=beta,
+            best_f=float(train_y_norm.max().item()),
+            num_restarts=acq_num_restarts,
+            raw_samples=acq_raw_samples,
         )
         y_next = benchmark.objective(x_next).to(dtype=torch.float)
 
@@ -320,6 +323,25 @@ def save_run_trace(run_rows: list[dict], out_dir: Path, seed: int) -> Path:
             )
     return run_csv
 
+
+
+def save_run_plot(run_rows: list[dict], out_dir: Path, seed: int) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    x = np.array([row["iteration"] for row in run_rows], dtype=float)
+    y = np.array([row["best_observed"] for row in run_rows], dtype=float)
+
+    fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(8, 4))
+    ax.plot(x, y, linewidth=1.5)
+    ax.set_title(f"{run_rows[0]['benchmark']} | {run_rows[0]['model']} | seed={seed}")
+    ax.set_xlabel("BO iteration")
+    ax.set_ylabel("Best observed value")
+    ax.grid(alpha=0.2)
+
+    fig.tight_layout()
+    plot_path = out_dir / f"bo_run_seed_{seed}.png"
+    fig.savefig(plot_path, dpi=180)
+    plt.close(fig)
+    return plot_path
 
 def aggregate_and_save(all_rows: list[dict], out_dir: Path) -> list[dict]:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -393,12 +415,15 @@ def plot_aggregated(agg_rows: list[dict], out_dir: Path) -> Path:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output_dir", type=Path, default=Path("outputs"))
-    parser.add_argument("--ambient_dim", type=int, default=20)
+    parser.add_argument("--synthetic_ambient_dim", type=int, default=50)
+    parser.add_argument("--real_ambient_dim", type=int, default=20)
     parser.add_argument("--n_init", type=int, default=12)
-    parser.add_argument("--n_iter", type=int, default=25)
+    parser.add_argument("--n_iter_synthetic", type=int, default=200)
+    parser.add_argument("--n_iter_real", type=int, default=500)
     parser.add_argument("--train_steps", type=int, default=80)
     parser.add_argument("--lr", type=float, default=0.05)
-    parser.add_argument("--num_candidates", type=int, default=1024)
+    parser.add_argument("--acq_num_restarts", type=int, default=10)
+    parser.add_argument("--acq_raw_samples", type=int, default=256)
     parser.add_argument("--seeds", type=int, nargs="+", default=[41, 42, 43, 44, 45])
     parser.add_argument("--models", nargs="+", default=list(MODEL_REGISTRY.keys()), choices=list(MODEL_REGISTRY.keys()))
     return parser.parse_args()
@@ -406,7 +431,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    benchmarks = build_benchmarks(ambient_dim=args.ambient_dim)
+    benchmarks = build_benchmarks(
+        synth_ambient_dim=args.synthetic_ambient_dim,
+        real_ambient_dim=args.real_ambient_dim,
+    )
 
     for bench in benchmarks:
         for model_name in args.models:
@@ -419,10 +447,11 @@ def main() -> None:
                     model_name=model_name,
                     seed=seed,
                     n_init=args.n_init,
-                    n_iter=args.n_iter,
+                    n_iter=args.n_iter_synthetic if bench.name.startswith("synthetic_") else args.n_iter_real,
                     train_steps=args.train_steps,
                     lr=args.lr,
-                    num_candidates=args.num_candidates,
+                    acq_num_restarts=args.acq_num_restarts,
+                    acq_raw_samples=args.acq_raw_samples,
                 )
                 run_rows: list[dict] = []
                 for it, best in enumerate(trace):
@@ -437,7 +466,9 @@ def main() -> None:
                     combo_rows.append(row)
 
                 run_csv_path = save_run_trace(run_rows, method_dir, seed=seed)
+                run_plot_path = save_run_plot(run_rows, method_dir, seed=seed)
                 print(f"Saved run trace to: {run_csv_path}")
+                print(f"Saved run plot to: {run_plot_path}")
 
             agg_csv_rows = aggregate_and_save(combo_rows, method_dir)
             plot_path = plot_aggregated(agg_csv_rows, method_dir)
