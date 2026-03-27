@@ -7,6 +7,7 @@ from typing import Optional
 
 import gpytorch
 import torch
+from botorch.models.gpytorch import GPyTorchModel
 from gpytorch.constraints import Positive
 from gpytorch.priors import HalfCauchyPrior
 
@@ -167,8 +168,9 @@ class CompositeKernel(gpytorch.kernels.Kernel):
         return projected_term + self.eps * residual_term
 
 
-class _BaseExactGP(gpytorch.models.ExactGP):
+class _BaseExactGP(gpytorch.models.ExactGP, GPyTorchModel):
     """Shared setup for exact GP models in this repository."""
+    _num_outputs = 1
 
     def __init__(
         self,
