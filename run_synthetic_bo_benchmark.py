@@ -40,6 +40,8 @@ MODEL_REGISTRY = {
     "composite": CompositeGPModel,
 }
 
+DEFAULT_DTYPE = torch.double
+
 
 @dataclass
 class BenchmarkSpec:
@@ -60,12 +62,15 @@ class EmbeddedSyntheticObjective:
         self.ambient_dim = ambient_dim
         self.latent_dim = latent_dim
         gen = torch.Generator(device="cpu").manual_seed(seed)
-        q, _ = torch.linalg.qr(torch.randn(ambient_dim, latent_dim, generator=gen, dtype=torch.float), mode="reduced")
+        q, _ = torch.linalg.qr(
+            torch.randn(ambient_dim, latent_dim, generator=gen, dtype=DEFAULT_DTYPE),
+            mode="reduced",
+        )
         self.proj = q[:, :latent_dim]
 
         # BoTorch test function bounds shape: 2 x d
-        self.lower = func.bounds[0].to(dtype=torch.float)
-        self.upper = func.bounds[1].to(dtype=torch.float)
+        self.lower = func.bounds[0].to(dtype=DEFAULT_DTYPE)
+        self.upper = func.bounds[1].to(dtype=DEFAULT_DTYPE)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         # x in [0, 1]^D -> latent coords in function domain.
@@ -106,9 +111,19 @@ def build_benchmarks(synth_ambient_dim: int) -> list[BenchmarkSpec]:
 class BOConfig:
     train_steps: int
     lr: float
+    manifold_lr_mult: float
     acq_num_restarts: int
     acq_raw_samples: int
     stagnation_patience: int
+
+
+@dataclass
+class SurrogateWarmStart:
+    W: torch.Tensor | None = None
+    lengthscale: torch.Tensor | None = None
+    outputscale: torch.Tensor | None = None
+    noise: torch.Tensor | None = None
+    eps: torch.Tensor | None = None
 
 
 def split_parameter_groups(model: torch.nn.Module) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
@@ -128,6 +143,8 @@ def fit_surrogate(
     subspace_dim: int,
     train_steps: int,
     lr: float,
+    manifold_lr_mult: float,
+    warm_start: SurrogateWarmStart | None = None,
 ) -> tuple[torch.nn.Module, gpytorch.likelihoods.GaussianLikelihood]:
     likelihood = gpytorch.likelihoods.GaussianLikelihood()
     model_cls = MODEL_REGISTRY[model_name]
@@ -142,12 +159,41 @@ def fit_surrogate(
         kwargs["eps_alpha"] = 0.1
 
     model = model_cls(**kwargs)
+    if warm_start is not None:
+        if warm_start.W is not None and hasattr(model, "W"):
+            model.W.data.copy_(warm_start.W.to(device=model.W.device, dtype=model.W.dtype))
+        if warm_start.lengthscale is not None:
+            target_kernel = model.covar_module.base_kernel
+            if hasattr(target_kernel, "base_kernel"):
+                target_kernel = target_kernel.base_kernel
+            if hasattr(target_kernel, "lengthscale"):
+                target_kernel.lengthscale = warm_start.lengthscale.to(
+                    device=target_kernel.lengthscale.device,
+                    dtype=target_kernel.lengthscale.dtype,
+                )
+        if warm_start.outputscale is not None and hasattr(model.covar_module, "outputscale"):
+            model.covar_module.outputscale = warm_start.outputscale.to(
+                device=model.covar_module.outputscale.device,
+                dtype=model.covar_module.outputscale.dtype,
+            )
+        if warm_start.noise is not None and hasattr(likelihood, "noise"):
+            likelihood.noise = warm_start.noise.to(
+                device=likelihood.noise.device,
+                dtype=likelihood.noise.dtype,
+            )
+        if warm_start.eps is not None and hasattr(model, "eps"):
+            model.covar_module.base_kernel.eps = warm_start.eps.to(
+                device=model.covar_module.base_kernel.eps.device,
+                dtype=model.covar_module.base_kernel.eps.dtype,
+            )
+
     model.train()
     likelihood.train()
 
     manifold_params, euclidean_params = split_parameter_groups(model)
     euclidean_opt = torch.optim.Adam(euclidean_params, lr=lr)
-    manifold_opt = RiemannianAdam(manifold_params, lr=lr) if manifold_params else None
+    manifold_lr = max(1e-5, lr * manifold_lr_mult)
+    manifold_opt = RiemannianAdam(manifold_params, lr=manifold_lr) if manifold_params else None
 
     mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
     for _ in range(train_steps):
@@ -165,6 +211,24 @@ def fit_surrogate(
 
     return model.eval(), likelihood.eval()
 
+def build_warm_start(model: torch.nn.Module, likelihood: gpytorch.likelihoods.GaussianLikelihood) -> SurrogateWarmStart:
+    kernel = model.covar_module.base_kernel
+    if hasattr(kernel, "base_kernel"):
+        projected_kernel = kernel
+        base_kernel = kernel.base_kernel
+    else:
+        projected_kernel = None
+        base_kernel = kernel
+
+    warm = SurrogateWarmStart(
+        W=model.W.detach().clone() if hasattr(model, "W") else None,
+        lengthscale=base_kernel.lengthscale.detach().clone() if hasattr(base_kernel, "lengthscale") else None,
+        outputscale=model.covar_module.outputscale.detach().clone() if hasattr(model.covar_module, "outputscale") else None,
+        noise=likelihood.noise.detach().clone() if hasattr(likelihood, "noise") else None,
+        eps=projected_kernel.eps.detach().clone() if projected_kernel is not None and hasattr(projected_kernel, "eps") else None,
+    )
+    return warm
+
 
 def pick_next_point(
     model: torch.nn.Module,
@@ -174,7 +238,7 @@ def pick_next_point(
     raw_samples: int,
 ) -> torch.Tensor:
     bounds = torch.stack(
-        [torch.zeros(dim, dtype=torch.float), torch.ones(dim, dtype=torch.float)]
+        [torch.zeros(dim, dtype=DEFAULT_DTYPE), torch.ones(dim, dtype=DEFAULT_DTYPE)]
     )
     acqf = LogExpectedImprovement(model=model, best_f=best_f)
     candidates, _ = optimize_acqf(
@@ -199,28 +263,32 @@ def run_single_bo(
     set_seed(seed)
 
     sobol = torch.quasirandom.SobolEngine(dimension=benchmark.ambient_dim, scramble=True, seed=seed)
-    train_x = sobol.draw(n_init).to(dtype=torch.float)
-    train_y = benchmark.objective(train_x).to(dtype=torch.float)
+    train_x = sobol.draw(n_init).to(dtype=DEFAULT_DTYPE)
+    train_y = benchmark.objective(train_x).to(dtype=DEFAULT_DTYPE)
 
     incumbent = float(torch.max(train_y).item())
     rows: list[dict] = [{"iteration": 0, "observed_value": incumbent, "best_observed": incumbent}]
     no_improvement_steps = 0
+    warm_start: SurrogateWarmStart | None = None
     for bo_iter in range(1, n_iter + 1):
         y_mean = train_y.mean()
         y_std = train_y.std(unbiased=False).clamp_min(1e-6)
         train_y_norm = (train_y - y_mean) / y_std
 
-        model, _ = fit_surrogate(
+        model, likelihood = fit_surrogate(
             model_name=model_name,
             train_x=train_x,
             train_y=train_y_norm,
             subspace_dim=benchmark.subspace_dim,
             train_steps=config.train_steps,
             lr=config.lr,
+            manifold_lr_mult=config.manifold_lr_mult,
+            warm_start=warm_start,
         )
+        warm_start = build_warm_start(model=model, likelihood=likelihood)
 
         if config.stagnation_patience > 0 and no_improvement_steps >= config.stagnation_patience:
-            x_next = torch.rand(1, benchmark.ambient_dim, dtype=torch.float)
+            x_next = torch.rand(1, benchmark.ambient_dim, dtype=DEFAULT_DTYPE)
             no_improvement_steps = 0
         else:
             x_next = pick_next_point(
@@ -230,7 +298,7 @@ def run_single_bo(
                 num_restarts=config.acq_num_restarts,
                 raw_samples=config.acq_raw_samples,
             )
-        y_next = benchmark.objective(x_next).to(dtype=torch.float)
+        y_next = benchmark.objective(x_next).to(dtype=DEFAULT_DTYPE)
         observed_value = float(y_next.item())
 
         train_x = torch.cat([train_x, x_next], dim=0)
@@ -359,13 +427,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_init", type=int, default=50)
     parser.add_argument("--n_iter", type=int, default=100)
     parser.add_argument("--train_steps", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=0.05)
+    parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument("--manifold_lr_mult", type=float, default=0.2)
     parser.add_argument("--acq_num_restarts", type=int, default=5)
     parser.add_argument("--acq_raw_samples", type=int, default=256)
     parser.add_argument("--stagnation_patience", type=int, default=20)
-    parser.add_argument("--standard_train_steps_mult", type=float, default=2.0)
-    parser.add_argument("--standard_lr_mult", type=float, default=0.5)
-    parser.add_argument("--standard_acq_mult", type=float, default=2.0)
+    parser.add_argument("--standard_train_steps_mult", type=float, default=1.0)
+    parser.add_argument("--standard_lr_mult", type=float, default=1.0)
+    parser.add_argument("--standard_acq_mult", type=float, default=1.0)
     parser.add_argument("--print_every", type=int, default=10)
     parser.add_argument("--seeds", type=int, nargs="+", default=[41, 42, 43, 44, 45])
     parser.add_argument("--models", nargs="+", default=list(MODEL_REGISTRY.keys()), choices=list(MODEL_REGISTRY.keys()))
@@ -387,6 +456,7 @@ def build_config(args: argparse.Namespace, model_name: str) -> BOConfig:
     return BOConfig(
         train_steps=train_steps,
         lr=lr,
+        manifold_lr_mult=args.manifold_lr_mult,
         acq_num_restarts=acq_num_restarts,
         acq_raw_samples=acq_raw_samples,
         stagnation_patience=args.stagnation_patience,

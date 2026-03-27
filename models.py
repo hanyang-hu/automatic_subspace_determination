@@ -213,6 +213,7 @@ class StandardGPModel(_BaseExactGP):
             base_kernel,
             outputscale_constraint=Positive(),
         )
+        self.to(dtype=train_x.dtype, device=train_x.device)
 
 
 class ProjectedGPModel(_BaseExactGP):
@@ -233,6 +234,7 @@ class ProjectedGPModel(_BaseExactGP):
             ProjectedKernel(input_dim=input_dim, subspace_dim=subspace_dim),
             outputscale_constraint=Positive(),
         )
+        self.to(dtype=train_x.dtype, device=train_x.device)
 
     @property
     def W(self) -> torch.nn.Parameter:
@@ -262,6 +264,7 @@ class CompositeGPModel(_BaseExactGP):
             ),
             outputscale_constraint=Positive(),
         )
+        self.to(dtype=train_x.dtype, device=train_x.device)
 
     @property
     def W(self) -> torch.nn.Parameter:
@@ -299,6 +302,7 @@ class LinearEmbeddingGPModel(_BaseExactGP):
             LinearEmbeddingKernel(input_dim=input_dim, subspace_dim=subspace_dim),
             outputscale_constraint=Positive(),
         )
+        self.to(dtype=train_x.dtype, device=train_x.device)
 
     @property
     def W(self) -> torch.nn.Parameter:
