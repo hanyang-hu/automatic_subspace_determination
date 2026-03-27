@@ -218,9 +218,6 @@ def fit_surrogate(
         kwargs["eps_alpha"] = 0.1
 
     model = model_cls(**kwargs)
-    # Keep model / likelihood dtype-device aligned with BO data tensors.
-    model = model.to(dtype=train_x.dtype, device=train_x.device)
-    likelihood = likelihood.to(dtype=train_x.dtype, device=train_x.device)
     model.train()
     likelihood.train()
 
