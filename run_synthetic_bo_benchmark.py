@@ -29,7 +29,7 @@ from botorch.acquisition.analytic import LogExpectedImprovement
 from botorch.optim import optimize_acqf
 from botorch.test_functions import Ackley, Levy, Rastrigin
 
-from manifold_optim import RiemannianAdam
+from manifold_optim import RiemannianAdam, alternating_coordinate_descent
 from models import CompositeGPModel, LinearEmbeddingGPModel, ProjectedGPModel, StandardGPModel
 
 
@@ -112,6 +112,10 @@ class BOConfig:
     train_steps: int
     lr: float
     manifold_lr_mult: float
+    embedding_grad_clip: float
+    alt_num_outer_steps: int
+    alt_euclidean_steps: int
+    alt_embedding_steps: int
     acq_num_restarts: int
     acq_raw_samples: int
     stagnation_patience: int
@@ -163,13 +167,13 @@ def _restore_state_subset(target_state: dict[str, torch.Tensor], source_state: d
 
 
 def split_parameter_groups(model: torch.nn.Module) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
-    manifold_params: list[torch.nn.Parameter] = []
-    if hasattr(model, "W") and getattr(model, "uses_riemannian_projection", False):
-        manifold_params.append(model.W)
+    embedding_params: list[torch.nn.Parameter] = []
+    if hasattr(model, "W"):
+        embedding_params.append(model.W)
 
-    manifold_ids = {id(p) for p in manifold_params}
-    euclidean_params = [p for p in model.parameters() if p.requires_grad and id(p) not in manifold_ids]
-    return manifold_params, euclidean_params
+    embedding_ids = {id(p) for p in embedding_params}
+    euclidean_params = [p for p in model.parameters() if p.requires_grad and id(p) not in embedding_ids]
+    return embedding_params, euclidean_params
 
 
 def fit_surrogate(
@@ -180,6 +184,10 @@ def fit_surrogate(
     train_steps: int,
     lr: float,
     manifold_lr_mult: float,
+    embedding_grad_clip: float,
+    alt_num_outer_steps: int,
+    alt_euclidean_steps: int,
+    alt_embedding_steps: int,
     warm_start: SurrogateWarmStart | None = None,
     warm_start_w_only: bool = True,
 ) -> tuple[torch.nn.Module, gpytorch.likelihoods.GaussianLikelihood]:
@@ -196,7 +204,6 @@ def fit_surrogate(
         kwargs["eps_alpha"] = 0.1
 
     model = model_cls(**kwargs)
-    likelihood.noise = torch.as_tensor(1e-6, dtype=train_x.dtype, device=train_x.device)
     if warm_start is not None:
         model_state = model.state_dict()
         if warm_start_w_only and warm_start.embedding_state is not None:
@@ -210,27 +217,52 @@ def fit_surrogate(
             lk_state = _restore_state_subset(lk_state, warm_start.likelihood_state)
             likelihood.load_state_dict(lk_state, strict=False)
 
+    # Re-apply the model-level likelihood noise floor after any warm-start restore.
+    model._stabilize_likelihood_noise()
+
     model.train()
     likelihood.train()
 
-    manifold_params, euclidean_params = split_parameter_groups(model)
-    euclidean_opt = torch.optim.Adam(euclidean_params, lr=lr)
+    embedding_params, euclidean_params = split_parameter_groups(model)
+    likelihood_params = [p for p in likelihood.parameters() if p.requires_grad]
+    euclidean_opt_params = [*euclidean_params, *likelihood_params]
+    euclidean_opt = torch.optim.Adam(euclidean_opt_params, lr=lr)
     manifold_lr = max(1e-5, lr * manifold_lr_mult)
-    manifold_opt = RiemannianAdam(manifold_params, lr=manifold_lr) if manifold_params else None
+    embedding_opt = None
+    if embedding_params:
+        if getattr(model, "uses_riemannian_projection", False):
+            embedding_opt = RiemannianAdam(embedding_params, lr=manifold_lr)
+        else:
+            embedding_opt = torch.optim.Adam(embedding_params, lr=manifold_lr)
 
     mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
-    for _ in range(train_steps):
-        euclidean_opt.zero_grad(set_to_none=True)
-        if manifold_opt is not None:
-            manifold_opt.zero_grad(set_to_none=True)
+    if not embedding_params:
+        # Standard GP path: preserve simple Euclidean optimization.
+        for _ in range(train_steps):
+            euclidean_opt.zero_grad(set_to_none=True)
+            output = model(train_x)
+            loss = -mll(output, train_y)
+            loss.backward()
+            euclidean_opt.step()
+        return model.eval(), likelihood.eval()
 
-        output = model(train_x)
-        loss = -mll(output, train_y)
-        loss.backward()
-
-        euclidean_opt.step()
-        if manifold_opt is not None:
-            manifold_opt.step()
+    alternating_coordinate_descent(
+        model=model,
+        likelihood=likelihood,
+        mll=mll,
+        train_x=train_x,
+        train_y=train_y,
+        train_steps=train_steps,
+        euclidean_opt=euclidean_opt,
+        embedding_opt=embedding_opt,
+        euclidean_params=euclidean_params,
+        embedding_params=embedding_params,
+        likelihood_params=likelihood_params,
+        embedding_grad_clip=embedding_grad_clip,
+        alt_num_outer_steps=alt_num_outer_steps,
+        alt_euclidean_steps=alt_euclidean_steps,
+        alt_embedding_steps=alt_embedding_steps,
+    )
 
     return model.eval(), likelihood.eval()
 
@@ -383,6 +415,10 @@ def run_single_bo(
             train_steps=config.train_steps,
             lr=config.lr,
             manifold_lr_mult=config.manifold_lr_mult,
+            embedding_grad_clip=config.embedding_grad_clip,
+            alt_num_outer_steps=config.alt_num_outer_steps,
+            alt_euclidean_steps=config.alt_euclidean_steps,
+            alt_embedding_steps=config.alt_embedding_steps,
             warm_start=warm_start,
             warm_start_w_only=warm_start_w_only,
         )
@@ -553,20 +589,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--warm_start_mode",
         type=str,
-        default="w_only",
+        default="all",
         choices=["w_only", "all"],
         help="Warm-start policy across BO iterations.",
     )
     parser.add_argument("--train_steps", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=0.05)
-    parser.add_argument("--manifold_lr_mult", type=float, default=1.)
+    parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument("--manifold_lr_mult", type=float, default=0.01)
+    parser.add_argument("--embedding_grad_clip", type=float, default=10.0)
+    parser.add_argument("--alt_num_outer_steps", type=int, default=0)
+    parser.add_argument("--alt_euclidean_steps", type=int, default=1)
+    parser.add_argument("--alt_embedding_steps", type=int, default=1)
     parser.add_argument("--acq_num_restarts", type=int, default=10)
     parser.add_argument("--acq_raw_samples", type=int, default=256)
     parser.add_argument("--stagnation_patience", type=int, default=20)
     parser.add_argument(
         "--acq_opt_space",
         type=str,
-        default="auto",
+        default="ambient",
         choices=["auto", "ambient", "latent"],
         help="Optimize acquisition in ambient space or latent space when embedding exists.",
     )
@@ -595,6 +635,10 @@ def build_config(args: argparse.Namespace, model_name: str) -> BOConfig:
         train_steps=train_steps,
         lr=lr,
         manifold_lr_mult=args.manifold_lr_mult,
+        embedding_grad_clip=args.embedding_grad_clip,
+        alt_num_outer_steps=args.alt_num_outer_steps,
+        alt_euclidean_steps=args.alt_euclidean_steps,
+        alt_embedding_steps=args.alt_embedding_steps,
         acq_num_restarts=acq_num_restarts,
         acq_raw_samples=acq_raw_samples,
         stagnation_patience=args.stagnation_patience,

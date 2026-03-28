@@ -8,7 +8,7 @@ from typing import Optional
 import gpytorch
 import torch
 from botorch.models.gpytorch import GPyTorchModel
-from gpytorch.constraints import Positive
+from gpytorch.constraints import GreaterThan, Positive
 from gpytorch.priors import HalfCauchyPrior
 
 
@@ -175,15 +175,32 @@ class _BaseExactGP(gpytorch.models.ExactGP, GPyTorchModel):
     ) -> None:
         super().__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ConstantMean()
+        self._noise_floor = 1e-4
+        self._noise_init = 1e-3
 
-        # Keep positivity on observation noise.
-        self.likelihood.noise_covar.register_constraint("raw_noise", Positive())
-        self.likelihood.noise_covar.noise = 1e-4  # Initialize to small noise for stability.
+        self._stabilize_likelihood_noise()
 
     def forward(self, x: torch.Tensor) -> gpytorch.distributions.MultivariateNormal:
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+    def _stabilize_likelihood_noise(self) -> None:
+        """Keep likelihood noise bounded away from zero for stable training."""
+        self.likelihood.noise_covar.register_constraint(
+            "raw_noise",
+            GreaterThan(self._noise_floor),
+        )
+        with torch.no_grad():
+            noise = self.likelihood.noise
+            if not torch.isfinite(noise).all():
+                self.likelihood.noise = torch.as_tensor(
+                    self._noise_init,
+                    dtype=noise.dtype,
+                    device=noise.device,
+                )
+            else:
+                self.likelihood.noise = noise.clamp_min(self._noise_floor)
 
 
 class StandardGPModel(_BaseExactGP):
