@@ -595,7 +595,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--train_steps", type=int, default=50)
     parser.add_argument("--lr", type=float, default=0.01)
-    parser.add_argument("--manifold_lr_mult", type=float, default=0.01)
+    parser.add_argument("--manifold_lr_mult", type=float, default=1.)
     parser.add_argument("--embedding_grad_clip", type=float, default=10.0)
     parser.add_argument("--alt_num_outer_steps", type=int, default=0)
     parser.add_argument("--alt_euclidean_steps", type=int, default=1)
