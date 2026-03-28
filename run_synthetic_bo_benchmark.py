@@ -115,23 +115,51 @@ class BOConfig:
     acq_num_restarts: int
     acq_raw_samples: int
     stagnation_patience: int
+    acq_opt_space: str
 
 
 @dataclass
 class SurrogateWarmStart:
-    W: torch.Tensor | None = None
-    lengthscale: torch.Tensor | None = None
-    outputscale: torch.Tensor | None = None
-    noise: torch.Tensor | None = None
-    eps: torch.Tensor | None = None
+    embedding_state: dict[str, torch.Tensor] | None = None
+    covar_state: dict[str, torch.Tensor] | None = None
+    likelihood_state: dict[str, torch.Tensor] | None = None
 
 
-def _to_cloned_tensor(value: torch.Tensor | float | None) -> torch.Tensor | None:
-    if value is None:
-        return None
-    if torch.is_tensor(value):
-        return value.detach().clone()
-    return torch.as_tensor(value, dtype=DEFAULT_DTYPE).detach().clone()
+@dataclass
+class EmbeddingDiagnostics:
+    orthogonality_error: float | None = None
+    grad_norm: float | None = None
+    has_nonfinite_w: bool = False
+    has_nonfinite_grad: bool = False
+    has_nonfinite_kernel_param: bool = False
+    projected_inconsistency: float | None = None
+    subspace_alignment: float | None = None
+
+
+def _clone_state_dict_subset(state: dict[str, torch.Tensor], predicate) -> dict[str, torch.Tensor]:
+    out: dict[str, torch.Tensor] = {}
+    for key, value in state.items():
+        if not predicate(key):
+            continue
+        if torch.is_tensor(value):
+            out[key] = value.detach().clone()
+    return out
+
+
+def _is_embedding_key(key: str) -> bool:
+    low = key.lower()
+    return key.endswith(".W") or low.endswith(".w") or ("projection" in low) or ("embedding" in low)
+
+
+def _restore_state_subset(target_state: dict[str, torch.Tensor], source_state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    restored = dict(target_state)
+    for key, value in source_state.items():
+        if key not in restored:
+            continue
+        if restored[key].shape != value.shape:
+            continue
+        restored[key] = value.to(device=restored[key].device, dtype=restored[key].dtype)
+    return restored
 
 
 def split_parameter_groups(model: torch.nn.Module) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
@@ -170,32 +198,17 @@ def fit_surrogate(
     model = model_cls(**kwargs)
     likelihood.noise = torch.as_tensor(1e-6, dtype=train_x.dtype, device=train_x.device)
     if warm_start is not None:
-        if warm_start.W is not None and hasattr(model, "W"):
-            model.W.data.copy_(warm_start.W.to(device=model.W.device, dtype=model.W.dtype))
-        if (not warm_start_w_only) and warm_start.lengthscale is not None:
-            target_kernel = model.covar_module.base_kernel
-            if hasattr(target_kernel, "base_kernel"):
-                target_kernel = target_kernel.base_kernel
-            if hasattr(target_kernel, "lengthscale"):
-                target_kernel.lengthscale = warm_start.lengthscale.to(
-                    device=target_kernel.lengthscale.device,
-                    dtype=target_kernel.lengthscale.dtype,
-                )
-        if (not warm_start_w_only) and warm_start.outputscale is not None and hasattr(model.covar_module, "outputscale"):
-            model.covar_module.outputscale = warm_start.outputscale.to(
-                device=model.covar_module.outputscale.device,
-                dtype=model.covar_module.outputscale.dtype,
-            )
-        if (not warm_start_w_only) and warm_start.noise is not None and hasattr(likelihood, "noise"):
-            likelihood.noise = warm_start.noise.to(
-                device=likelihood.noise.device,
-                dtype=likelihood.noise.dtype,
-            )
-        if (not warm_start_w_only) and warm_start.eps is not None and hasattr(model, "eps"):
-            model.covar_module.base_kernel.eps = warm_start.eps.to(
-                device=model.covar_module.base_kernel.eps.device,
-                dtype=model.covar_module.base_kernel.eps.dtype,
-            )
+        model_state = model.state_dict()
+        if warm_start_w_only and warm_start.embedding_state is not None:
+            model_state = _restore_state_subset(model_state, warm_start.embedding_state)
+        if (not warm_start_w_only) and warm_start.covar_state is not None:
+            model_state = _restore_state_subset(model_state, warm_start.covar_state)
+        model.load_state_dict(model_state, strict=False)
+
+        if (not warm_start_w_only) and warm_start.likelihood_state is not None:
+            lk_state = likelihood.state_dict()
+            lk_state = _restore_state_subset(lk_state, warm_start.likelihood_state)
+            likelihood.load_state_dict(lk_state, strict=False)
 
     model.train()
     likelihood.train()
@@ -226,22 +239,73 @@ def build_warm_start(
     likelihood: gpytorch.likelihoods.GaussianLikelihood,
     include_non_w: bool = False,
 ) -> SurrogateWarmStart:
-    kernel = model.covar_module.base_kernel
-    if hasattr(kernel, "base_kernel"):
-        projected_kernel = kernel
-        base_kernel = kernel.base_kernel
-    else:
-        projected_kernel = None
-        base_kernel = kernel
-
-    warm = SurrogateWarmStart(
-        W=_to_cloned_tensor(model.W if hasattr(model, "W") else None),
-        lengthscale=_to_cloned_tensor(base_kernel.lengthscale) if include_non_w and hasattr(base_kernel, "lengthscale") else None,
-        outputscale=_to_cloned_tensor(model.covar_module.outputscale) if include_non_w and hasattr(model.covar_module, "outputscale") else None,
-        noise=_to_cloned_tensor(likelihood.noise) if include_non_w and hasattr(likelihood, "noise") else None,
-        eps=_to_cloned_tensor(projected_kernel.eps) if include_non_w and projected_kernel is not None and hasattr(projected_kernel, "eps") else None,
+    model_state = model.state_dict()
+    embedding_state = _clone_state_dict_subset(model_state, _is_embedding_key)
+    covar_state = (
+        _clone_state_dict_subset(model_state, lambda key: key.startswith("covar_module."))
+        if include_non_w
+        else None
     )
-    return warm
+    likelihood_state = (
+        _clone_state_dict_subset(likelihood.state_dict(), lambda _key: True)
+        if include_non_w
+        else None
+    )
+    return SurrogateWarmStart(
+        embedding_state=embedding_state,
+        covar_state=covar_state,
+        likelihood_state=likelihood_state,
+    )
+
+
+def _has_embedding_matrix(model: torch.nn.Module) -> bool:
+    return hasattr(model, "W")
+
+
+def _projected_inconsistency(train_x: torch.Tensor, train_y: torch.Tensor, w: torch.Tensor) -> float:
+    if train_x.shape[0] < 2:
+        return 0.0
+    z = train_x.to(device=w.device, dtype=w.dtype) @ w
+    dmat = torch.cdist(z, z)
+    eye = torch.eye(dmat.shape[0], device=dmat.device, dtype=torch.bool)
+    dmat = dmat.masked_fill(eye, float("inf"))
+    nearest = torch.argmin(dmat, dim=1)
+    y = train_y.to(device=nearest.device)
+    gap = (y - y[nearest]).abs().mean()
+    scale = y.abs().mean().clamp_min(1e-8)
+    return float((gap / scale).detach().cpu())
+
+
+def collect_embedding_diagnostics(
+    model: torch.nn.Module,
+    train_x: torch.Tensor,
+    train_y: torch.Tensor,
+    true_projection: torch.Tensor | None = None,
+) -> EmbeddingDiagnostics:
+    if not _has_embedding_matrix(model):
+        return EmbeddingDiagnostics()
+    w = model.W
+    grad = w.grad
+    diag = EmbeddingDiagnostics(
+        orthogonality_error=float(torch.linalg.matrix_norm(w.transpose(-2, -1) @ w - torch.eye(w.shape[-1], device=w.device, dtype=w.dtype), ord="fro").detach().cpu())
+        if getattr(model, "uses_riemannian_projection", False)
+        else None,
+        grad_norm=float(grad.norm().detach().cpu()) if grad is not None else None,
+        has_nonfinite_w=not torch.isfinite(w).all().item(),
+        has_nonfinite_grad=(grad is not None and (not torch.isfinite(grad).all().item())),
+        projected_inconsistency=_projected_inconsistency(train_x=train_x, train_y=train_y, w=w),
+    )
+    kernel_nonfinite = False
+    for name, p in model.named_parameters():
+        if "covar_module" in name and (not torch.isfinite(p).all().item()):
+            kernel_nonfinite = True
+            break
+    diag.has_nonfinite_kernel_param = kernel_nonfinite
+    if true_projection is not None:
+        w_true = true_projection.to(device=w.device, dtype=w.dtype)
+        overlap = torch.linalg.svdvals(w.transpose(-2, -1) @ w_true)
+        diag.subspace_alignment = float(overlap.mean().detach().cpu())
+    return diag
 
 
 def pick_next_point(
@@ -250,7 +314,28 @@ def pick_next_point(
     best_f: float,
     num_restarts: int,
     raw_samples: int,
+    optimize_in_latent: bool = False,
 ) -> torch.Tensor:
+    if optimize_in_latent and hasattr(model, "W"):
+        W = model.W.detach()
+        latent_dim = W.shape[-1]
+        z = torch.nn.Parameter(torch.zeros(num_restarts, 1, latent_dim, dtype=DEFAULT_DTYPE))
+        z.data.uniform_(-0.75, 0.75)
+        opt = torch.optim.Adam([z], lr=0.05)
+        acqf = LogExpectedImprovement(model=model, best_f=best_f)
+        pinv = torch.linalg.pinv(W.to(dtype=DEFAULT_DTYPE))
+        for _ in range(80):
+            opt.zero_grad(set_to_none=True)
+            x = torch.clamp(z @ pinv, 0.0, 1.0)
+            scores = acqf(x).sum()
+            (-scores).backward()
+            opt.step()
+        with torch.no_grad():
+            x_final = torch.clamp(z @ pinv, 0.0, 1.0)
+            vals = acqf(x_final).view(-1)
+            idx = torch.argmax(vals)
+            return x_final[idx]
+
     bounds = torch.stack(
         [torch.zeros(dim, dtype=DEFAULT_DTYPE), torch.ones(dim, dtype=DEFAULT_DTYPE)]
     )
@@ -311,12 +396,16 @@ def run_single_bo(
             x_next = torch.rand(1, benchmark.ambient_dim, dtype=DEFAULT_DTYPE)
             no_improvement_steps = 0
         else:
+            optimize_in_latent = config.acq_opt_space == "latent" or (
+                config.acq_opt_space == "auto" and _has_embedding_matrix(model)
+            )
             x_next = pick_next_point(
                 model=model,
                 dim=benchmark.ambient_dim,
                 best_f=float(train_y_norm.max().item()),
                 num_restarts=config.acq_num_restarts,
                 raw_samples=config.acq_raw_samples,
+                optimize_in_latent=optimize_in_latent,
             )
         y_next = benchmark.objective(x_next).to(dtype=DEFAULT_DTYPE)
         observed_value = float(y_next.item())
@@ -330,9 +419,24 @@ def run_single_bo(
 
         rows.append({"iteration": bo_iter, "observed_value": observed_value, "best_observed": incumbent})
         if print_every > 0 and bo_iter % print_every == 0:
+            diag = collect_embedding_diagnostics(
+                model=model,
+                train_x=train_x,
+                train_y=train_y,
+                true_projection=getattr(benchmark.objective, "proj", None),
+            )
+            diag_msg = ""
+            if _has_embedding_matrix(model):
+                diag_msg = (
+                    f" | W_grad_norm={diag.grad_norm} ortho_err={diag.orthogonality_error} "
+                    f"nonfinite(W/grad/kernel)=({diag.has_nonfinite_w}/{diag.has_nonfinite_grad}/{diag.has_nonfinite_kernel_param}) "
+                    f"proj_inconsistency={diag.projected_inconsistency:.3f}"
+                )
+                if diag.subspace_alignment is not None:
+                    diag_msg += f" subspace_align={diag.subspace_alignment:.3f}"
             print(
                 f"[ITER {bo_iter:04d}] observed={observed_value:.6f} "
-                f"incumbent={incumbent:.6f} stalled_for={no_improvement_steps}"
+                f"incumbent={incumbent:.6f} stalled_for={no_improvement_steps}{diag_msg}"
             )
 
     return rows
@@ -459,6 +563,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--acq_num_restarts", type=int, default=10)
     parser.add_argument("--acq_raw_samples", type=int, default=256)
     parser.add_argument("--stagnation_patience", type=int, default=20)
+    parser.add_argument(
+        "--acq_opt_space",
+        type=str,
+        default="auto",
+        choices=["auto", "ambient", "latent"],
+        help="Optimize acquisition in ambient space or latent space when embedding exists.",
+    )
     parser.add_argument("--standard_train_steps_mult", type=float, default=1.0)
     parser.add_argument("--standard_lr_mult", type=float, default=1.0)
     parser.add_argument("--standard_acq_mult", type=float, default=1.0)
@@ -487,6 +598,7 @@ def build_config(args: argparse.Namespace, model_name: str) -> BOConfig:
         acq_num_restarts=acq_num_restarts,
         acq_raw_samples=acq_raw_samples,
         stagnation_patience=args.stagnation_patience,
+        acq_opt_space=args.acq_opt_space,
     )
 
 
