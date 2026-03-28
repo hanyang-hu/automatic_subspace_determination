@@ -443,9 +443,9 @@ def plot_aggregated(agg_rows: list[dict], out_dir: Path) -> Path:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output_dir", type=Path, default=Path("outputs"))
-    parser.add_argument("--synthetic_ambient_dim", type=int, default=25)
+    parser.add_argument("--synthetic_ambient_dim", type=int, default=50)
     parser.add_argument("--n_init", type=int, default=50)
-    parser.add_argument("--n_iter", type=int, default=200)
+    parser.add_argument("--n_iter", type=int, default=500)
     parser.add_argument(
         "--warm_start_mode",
         type=str,
@@ -454,15 +454,15 @@ def parse_args() -> argparse.Namespace:
         help="Warm-start policy across BO iterations.",
     )
     parser.add_argument("--train_steps", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=0.01)
-    parser.add_argument("--manifold_lr_mult", type=float, default=0.2)
-    parser.add_argument("--acq_num_restarts", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=0.05)
+    parser.add_argument("--manifold_lr_mult", type=float, default=1.)
+    parser.add_argument("--acq_num_restarts", type=int, default=10)
     parser.add_argument("--acq_raw_samples", type=int, default=256)
     parser.add_argument("--stagnation_patience", type=int, default=20)
     parser.add_argument("--standard_train_steps_mult", type=float, default=1.0)
     parser.add_argument("--standard_lr_mult", type=float, default=1.0)
     parser.add_argument("--standard_acq_mult", type=float, default=1.0)
-    parser.add_argument("--print_every", type=int, default=10)
+    parser.add_argument("--print_every", type=int, default=50)
     parser.add_argument("--seeds", type=int, nargs="+", default=[41, 42, 43, 44, 45])
     parser.add_argument("--models", nargs="+", default=list(MODEL_REGISTRY.keys()), choices=list(MODEL_REGISTRY.keys()))
     return parser.parse_args()

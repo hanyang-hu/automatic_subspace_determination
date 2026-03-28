@@ -118,7 +118,7 @@ class CompositeKernel(gpytorch.kernels.Kernel):
         # print("Initialized CompositeKernel with eps_alpha =", eps_alpha)
         # Initialize eps with the alpha value to encourage starting with a meaningful contribution from the residual kernel.
         self._set_eps(eps_alpha)
-        print("Initial eps value set to:", self.eps.item())
+        # print("Initial eps value set to:", self.eps.item())
         self.register_prior(
             "eps_prior",
             HalfCauchyPrior(scale=eps_alpha),
@@ -183,6 +183,7 @@ class _BaseExactGP(gpytorch.models.ExactGP, GPyTorchModel):
 
         # Keep positivity on observation noise.
         self.likelihood.noise_covar.register_constraint("raw_noise", Positive())
+        self.likelihood.noise_covar.noise = 1e-4  # Initialize to small noise for stability.
 
     def forward(self, x: torch.Tensor) -> gpytorch.distributions.MultivariateNormal:
         mean_x = self.mean_module(x)
