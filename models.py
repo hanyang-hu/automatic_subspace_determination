@@ -61,10 +61,8 @@ class ProjectedKernel(gpytorch.kernels.Kernel):
             raise ValueError(
                 f"Expected input dimension {self.input_dim}, got {x.size(-1)}"
             )
-        
-        # x = x.to(self.W.dtype)  # Ensure input is same dtype as W for matmul
-
-        return x @ self.W
+        x_safe = x.to(device=self.W.device, dtype=self.W.dtype)
+        return x_safe @ self.W
 
     def forward(
         self,
@@ -115,10 +113,7 @@ class CompositeKernel(gpytorch.kernels.Kernel):
         _initialize_kernel_lengthscale(self.residual_kernel, input_dim)
 
         self._ensure_raw_eps()
-        # print("Initialized CompositeKernel with eps_alpha =", eps_alpha)
-        # Initialize eps with the alpha value to encourage starting with a meaningful contribution from the residual kernel.
         self._set_eps(eps_alpha)
-        # print("Initial eps value set to:", self.eps.item())
         self.register_prior(
             "eps_prior",
             HalfCauchyPrior(scale=eps_alpha),
