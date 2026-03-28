@@ -176,6 +176,18 @@ def split_parameter_groups(model: torch.nn.Module) -> tuple[list[torch.nn.Parame
     return embedding_params, euclidean_params
 
 
+def unique_parameters(params: list[torch.nn.Parameter]) -> list[torch.nn.Parameter]:
+    seen: set[int] = set()
+    unique: list[torch.nn.Parameter] = []
+    for param in params:
+        param_id = id(param)
+        if param_id in seen:
+            continue
+        seen.add(param_id)
+        unique.append(param)
+    return unique
+
+
 def fit_surrogate(
     model_name: str,
     train_x: torch.Tensor,
@@ -225,7 +237,7 @@ def fit_surrogate(
 
     embedding_params, euclidean_params = split_parameter_groups(model)
     likelihood_params = [p for p in likelihood.parameters() if p.requires_grad]
-    euclidean_opt_params = [*euclidean_params, *likelihood_params]
+    euclidean_opt_params = unique_parameters([*euclidean_params, *likelihood_params])
     euclidean_opt = torch.optim.Adam(euclidean_opt_params, lr=lr)
     manifold_lr = max(1e-5, lr * manifold_lr_mult)
     embedding_opt = None
