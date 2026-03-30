@@ -249,6 +249,8 @@ class ProjectedGPModel(_BaseExactGP):
         )
         self.to(dtype=train_x.dtype, device=train_x.device)
 
+        # print("Subspace_dim:", subspace_dim)
+
     @property
     def W(self) -> torch.nn.Parameter:
         return self.covar_module.base_kernel.W

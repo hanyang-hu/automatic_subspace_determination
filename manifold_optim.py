@@ -148,6 +148,8 @@ def alternating_coordinate_descent(
             euclidean_opt.step()
             completed_steps += 1
 
+            # print(f"Completed {completed_steps}/{train_steps} training steps", end="\r")
+
         if completed_steps >= train_steps:
             break
 
@@ -166,6 +168,8 @@ def alternating_coordinate_descent(
             torch.nn.utils.clip_grad_norm_(embedding_params, max_norm=embedding_grad_clip)
             embedding_opt.step()
             completed_steps += 1
+
+            # print(f"Completed {completed_steps}/{train_steps} training steps", end="\r")
 
     # Restore flags for downstream diagnostics / warm-start capture.
     set_requires_grad(euclidean_params, True)

@@ -216,6 +216,14 @@ def fit_surrogate(
         kwargs["eps_alpha"] = 0.1
 
     model = model_cls(**kwargs)
+    
+    # Move computation to GPU if available and training data size is large enough.
+    if torch.cuda.is_available() and train_x.numel() > 500:
+        model = model.cuda()
+        likelihood = likelihood.cuda()
+        train_x = train_x.cuda()
+        train_y = train_y.cuda()
+
     if warm_start is not None:
         model_state = model.state_dict()
         if warm_start_w_only and warm_start.embedding_state is not None:
@@ -256,6 +264,8 @@ def fit_surrogate(
             loss = -mll(output, train_y)
             loss.backward()
             euclidean_opt.step()
+
+            # print(f"Completed {_ + 1}/{train_steps} training steps", end="\r")
         return model.eval(), likelihood.eval()
 
     alternating_coordinate_descent(
@@ -423,7 +433,7 @@ def run_single_bo(
             model_name=model_name,
             train_x=train_x,
             train_y=train_y_norm,
-            subspace_dim=benchmark.subspace_dim,
+            subspace_dim=20,
             train_steps=config.train_steps,
             lr=config.lr,
             manifold_lr_mult=config.manifold_lr_mult,
@@ -596,8 +606,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output_dir", type=Path, default=Path("outputs"))
     parser.add_argument("--synthetic_ambient_dim", type=int, default=50)
-    parser.add_argument("--n_init", type=int, default=50)
-    parser.add_argument("--n_iter", type=int, default=500)
+    parser.add_argument("--n_init", type=int, default=200)
+    parser.add_argument("--n_iter", type=int, default=300)
     parser.add_argument(
         "--warm_start_mode",
         type=str,
@@ -605,7 +615,7 @@ def parse_args() -> argparse.Namespace:
         choices=["w_only", "all"],
         help="Warm-start policy across BO iterations.",
     )
-    parser.add_argument("--train_steps", type=int, default=50)
+    parser.add_argument("--train_steps", type=int, default=100)
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--manifold_lr_mult", type=float, default=1.)
     parser.add_argument("--embedding_grad_clip", type=float, default=10.0)
@@ -626,7 +636,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--standard_lr_mult", type=float, default=1.0)
     parser.add_argument("--standard_acq_mult", type=float, default=1.0)
     parser.add_argument("--print_every", type=int, default=50)
-    parser.add_argument("--seeds", type=int, nargs="+", default=[41, 42, 43, 44, 45])
+    parser.add_argument("--seeds", type=int, nargs="+", default=[41, 42, 43])
     parser.add_argument("--models", nargs="+", default=list(MODEL_REGISTRY.keys()), choices=list(MODEL_REGISTRY.keys()))
     return parser.parse_args()
 
