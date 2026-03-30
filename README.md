@@ -100,6 +100,38 @@ Useful options:
 - `--stagnation_patience 20`
 - `--print_every 10`
 - `--seeds 41 42 43 44 45`
+- `--model_subspace_dim 20`: learned subspace dimension for `projected`, `linear_embedding`, and `composite` models.
+
+### Compare model mean traces for one synthetic benchmark
+
+After running BO, you can compare only the **mean** trajectories across models (no std shading):
+
+```bash
+python visualize_synthetic_bo_means.py --benchmark_output_dir outputs/synthetic_levy
+```
+
+This writes:
+
+- `outputs/synthetic_levy/bo_model_mean_comparison.png`
+
+### Subspace alignment vs dataset size (Ackley 6D in 50D)
+
+Use `run_synthetic_subspace_alignment.py` to study how many Sobol-sampled data points are needed to recover the true subspace, with warm-starting as dataset size grows.
+
+```bash
+python run_synthetic_subspace_alignment.py \
+  --output_dir outputs/subspace_alignment_ackley \
+  --models projected linear_embedding composite \
+  --n_start 50 --n_step 25 --n_steps 8 \
+  --num_repeats 5 --seeds 41 42 43 44 45 \
+  --subspace_dim 6 --latent_dim 6
+```
+
+Outputs:
+
+- `alignment_all_runs.csv`
+- `alignment_aggregated.csv`
+- `alignment_vs_dataset_size.png`
 
 Outputs (for each benchmark/model pair):
 
