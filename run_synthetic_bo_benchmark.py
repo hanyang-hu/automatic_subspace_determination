@@ -413,6 +413,7 @@ def run_single_bo(
     config: BOConfig,
     print_every: int,
     warm_start_w_only: bool,
+    model_subspace_dim: int,
 ) -> list[dict]:
     set_seed(seed)
 
@@ -433,7 +434,7 @@ def run_single_bo(
             model_name=model_name,
             train_x=train_x,
             train_y=train_y_norm,
-            subspace_dim=20,
+            subspace_dim=model_subspace_dim,
             train_steps=config.train_steps,
             lr=config.lr,
             manifold_lr_mult=config.manifold_lr_mult,
@@ -609,6 +610,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_init", type=int, default=200)
     parser.add_argument("--n_iter", type=int, default=300)
     parser.add_argument(
+        "--model_subspace_dim",
+        type=int,
+        default=20,
+        help="Learned subspace dimension for projected/composite/linear_embedding models.",
+    )
+    parser.add_argument(
         "--warm_start_mode",
         type=str,
         default="all",
@@ -694,6 +701,7 @@ def main() -> None:
                     config=config,
                     print_every=args.print_every,
                     warm_start_w_only=args.warm_start_mode == "w_only",
+                    model_subspace_dim=args.model_subspace_dim,
                 )
                 run_rows: list[dict] = []
                 for row_data in trace_rows:
