@@ -47,13 +47,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_start", type=int, default=50)
     parser.add_argument("--n_step", type=int, default=25, help="New Sobol points added each step.")
     parser.add_argument("--n_steps", type=int, default=8, help="Number of growth steps after n_start.")
-    parser.add_argument("--num_repeats", type=int, default=5)
-    parser.add_argument("--seeds", type=int, nargs="+", default=[41, 42, 43, 44, 45])
+    parser.add_argument("--num_repeats", type=int, default=3)
+    parser.add_argument("--seeds", type=int, nargs="+", default=[41, 42, 43])
 
     parser.add_argument("--subspace_dim", type=int, default=6, help="Learned model subspace dimension.")
     parser.add_argument("--objective_seed", type=int, default=101)
 
-    parser.add_argument("--train_steps", type=int, default=120)
+    parser.add_argument("--train_steps", type=int, default=100)
     parser.add_argument("--lr", type=float, default=0.02)
     parser.add_argument("--manifold_lr_mult", type=float, default=1.0)
     parser.add_argument("--embedding_grad_clip", type=float, default=10.0)
@@ -88,7 +88,7 @@ def grassmann_geodesic_distance(w_est: torch.Tensor, w_true: torch.Tensor) -> fl
         raise ValueError(f"Shape mismatch: estimated {w_est.shape}, true {w_true.shape}")
 
     qe = _orthonormalize_cols(w_est)
-    qt = _orthonormalize_cols(w_true)
+    qt = _orthonormalize_cols(w_true).to(dtype=qe.dtype, device=qe.device)
     overlap = qe.transpose(-2, -1) @ qt
     gram = overlap.transpose(-2, -1) @ overlap
     eigvals = torch.linalg.eigvalsh(gram)
