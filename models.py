@@ -39,7 +39,7 @@ class ProjectedKernel(gpytorch.kernels.Kernel):
 
         self.input_dim = input_dim
         self.subspace_dim = subspace_dim
-        self.base_kernel = base_kernel or gpytorch.kernels.RBFKernel(
+        self.base_kernel = base_kernel or gpytorch.kernels.keops.RBFKernel(
             ard_num_dims=subspace_dim,
             lengthscale_constraint=Positive(),
         )
@@ -106,7 +106,7 @@ class CompositeKernel(gpytorch.kernels.Kernel):
             subspace_dim=subspace_dim,
             base_kernel=projected_base_kernel,
         )
-        self.residual_kernel = residual_kernel or gpytorch.kernels.RBFKernel(
+        self.residual_kernel = residual_kernel or gpytorch.kernels.keops.RBFKernel(
             ard_num_dims=input_dim,
             lengthscale_constraint=Positive(),
         )
@@ -217,7 +217,7 @@ class StandardGPModel(_BaseExactGP):
         super().__init__(train_x, train_y, likelihood)
         del subspace_dim  # Kept for constructor consistency across model choices.
 
-        base_kernel = gpytorch.kernels.RBFKernel(
+        base_kernel = gpytorch.kernels.keops.RBFKernel(
             ard_num_dims=input_dim,
             lengthscale_constraint=Positive(),
         )

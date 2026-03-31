@@ -40,20 +40,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["projected", "linear_embedding", "composite"],
-        choices=["projected", "linear_embedding", "composite"],
+        default=["projected", "composite", "linear_embedding"],
+        choices=["projected", "composite", "linear_embedding"],
         help="Models that learn a subspace matrix W.",
     )
-    parser.add_argument("--n_start", type=int, default=50)
-    parser.add_argument("--n_step", type=int, default=25, help="New Sobol points added each step.")
-    parser.add_argument("--n_steps", type=int, default=8, help="Number of growth steps after n_start.")
+    parser.add_argument("--n_start", type=int, default=500)
+    parser.add_argument("--n_step", type=int, default=100, help="New Sobol points added each step.")
+    parser.add_argument("--n_steps", type=int, default=25, help="Number of growth steps after n_start.")
     parser.add_argument("--num_repeats", type=int, default=3)
     parser.add_argument("--seeds", type=int, nargs="+", default=[41, 42, 43])
 
     parser.add_argument("--subspace_dim", type=int, default=6, help="Learned model subspace dimension.")
     parser.add_argument("--objective_seed", type=int, default=101)
 
-    parser.add_argument("--train_steps", type=int, default=100)
+    parser.add_argument("--train_steps", type=int, default=300)
     parser.add_argument("--lr", type=float, default=0.02)
     parser.add_argument("--manifold_lr_mult", type=float, default=1.0)
     parser.add_argument("--embedding_grad_clip", type=float, default=10.0)
@@ -157,12 +157,12 @@ def plot_aggregated(agg_rows: list[dict], out_path: Path) -> None:
         x = np.array([r["n_train"] for r in rows], dtype=float)
         mean = np.array([r["geodesic_mean"] for r in rows], dtype=float)
         std = np.array([r["geodesic_std"] for r in rows], dtype=float)
-        ax.plot(x, mean, marker="o", label=model)
+        ax.plot(x, mean, marker="o", label=model if model != "linear_embedding" else "linear embedding")
         ax.fill_between(x, mean - std, mean + std, alpha=0.2)
 
-    ax.set_title("Subspace alignment vs dataset size (Ackley 6D in 50D)")
-    ax.set_xlabel("Number of training points")
-    ax.set_ylabel("Grassmann geodesic distance (lower is better)")
+    ax.set_title("Subspace Alignment vs Dataset Size (Ackley 6D in 50D)")
+    ax.set_xlabel("Number of Data Points")
+    ax.set_ylabel("Subspace Alignment Score")
     ax.grid(alpha=0.2)
     ax.legend(loc="best")
 

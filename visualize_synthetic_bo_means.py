@@ -58,7 +58,7 @@ def main() -> None:
     if not model_dirs:
         raise ValueError(f"No model subdirectories found under: {benchmark_dir}")
 
-    fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(9, 4.5))
+    fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(9, 9))
     loaded_any = False
 
     for model_dir in model_dirs:
@@ -73,9 +73,14 @@ def main() -> None:
     if not loaded_any:
         raise ValueError(f"No bo_results_aggregated.csv files found under: {benchmark_dir}")
 
-    ax.set_title(f"Model comparison (mean best observed) | {benchmark_dir.name}")
+    benchmark_name = {
+        "synthetic_levy": "Levy 6D in 50D",
+        "synthetic_ackley": "Ackley 6D in 50D",
+        "synthetic_rastrigin": "Rastrigin 6D in 50D"
+    }
+    ax.set_title(f"{benchmark_name.get(benchmark_dir.name, benchmark_dir.name)}")
     ax.set_xlabel("BO iteration")
-    ax.set_ylabel("Mean best observed value")
+    ax.set_ylabel("Best Observed Value")
     ax.grid(alpha=0.2)
     ax.legend(loc="best")
 
